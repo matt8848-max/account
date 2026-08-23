@@ -1,0 +1,16 @@
+[application]
+
+[bundle]
+identifier = "com.account.app"
+publisher = "Account"
+resources = []
+icon = []
+
+[bundle.windows]
+webview_install_mode = "Skip"
+
+[web.app]
+title = "记账软件"
+
+[web.resource.dev]
+script = []
