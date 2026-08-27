@@ -84,6 +84,9 @@ pub struct Record {
     pub group_id: i64,
     /// 组名（所属组，最多 64 字符）
     pub group_name: Option<String>,
+    /// 组包含的所有月份（逗号分隔，如 `2026-08,2026-09`）；
+    /// 用于展示组跨哪些月份，跨月表中该组的每条记录都冗余存储同一份
+    pub group_months: Option<String>,
     /// 转出交易对象
     pub from_id: i64,
     /// 转入交易对象

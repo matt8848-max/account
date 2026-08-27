@@ -9,21 +9,23 @@
 use crate::db;
 use crate::db::month;
 use crate::models::{
-    Counterparty, CounterpartySubmit, Currency, CurrencySubmit, DeleteRequest, Group, GroupSubmit,
+    Counterparty, CounterpartySubmit, Currency, CurrencySubmit, DeleteRequest, GroupSubmit,
     MonthMeta, MonthQuery, Money, ObjectStatsQuery, RangeQuery, Record, RecordSubmit,
 };
 use anyhow::Result as AnyhowResult;
 use axum::{
-    Json,
+    Json, Router,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{post, put},
-    Router,
 };
 use rusqlite::Connection;
 use serde_json::json;
-use std::sync::{Arc, Mutex};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 /// API 当前版本
 pub const API_VERSION: i64 = 1;
@@ -32,6 +34,9 @@ pub const API_VERSION: i64 = 1;
 #[derive(Clone)]
 pub struct AppState {
     pub conn: Arc<Mutex<Connection>>,
+    /// 服务器关闭句柄：`POST /api/close` 触发优雅关闭
+    /// （泛型为监听地址类型，与 `bind_rustls` 的 Server 匹配）
+    pub shutdown: axum_server::Handle<SocketAddr>,
 }
 
 /// 统一错误响应
@@ -74,6 +79,8 @@ pub fn router(state: AppState) -> Router {
         // 基础接口
         .route("/api/live", put(live))
         .route("/api/help", put(help))
+        // 关闭
+        .route("/api/close", post(close))
         // 增（POST）
         .route("/api/currencies", post(add_currency))
         .route("/api/counterparties", post(add_counterparty))
@@ -99,7 +106,10 @@ pub fn router(state: AppState) -> Router {
 
 /// 提供统一的连接访问
 pub(crate) fn conn(state: &AppState) -> AnyhowResult<std::sync::MutexGuard<'_, Connection>> {
-    state.conn.lock().map_err(|_| anyhow::anyhow!("数据库锁获取失败"))
+    state
+        .conn
+        .lock()
+        .map_err(|_| anyhow::anyhow!("数据库锁获取失败"))
 }
 
 // ---------- 基础接口 ----------
@@ -118,6 +128,9 @@ async fn help() -> Response {
             "PUT /api/live": "存活检查",
             "PUT /api/help": "接口定义",
             "PUT /api/version": "API 与数据库版本号"
+        },
+        "close": {
+            "POST /api/close": "关闭服务器（优雅关闭）"
         },
         "create": {
             "POST /api/currencies": "添加货币",
@@ -143,10 +156,28 @@ async fn help() -> Response {
     }))
 }
 
+/// POST /api/close — 关闭服务器
+///
+/// 先向客户端返回成功响应，再延迟触发服务器优雅关闭，
+/// 确保客户端能完整收到 `{ "closed": true }` 结果。
+async fn close(State(state): State<AppState>) -> Response {
+    log::info!("收到关闭请求，服务器将在响应后关闭");
+    let handle = state.shutdown.clone();
+    tokio::spawn(async move {
+        // 预留 100ms 让当前响应发送完毕
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        handle.shutdown();
+    });
+    ok_json(json!({ "closed": true }))
+}
+
 // ---------- 增 ----------
 
 /// POST /api/currencies — 添加货币
-async fn add_currency(State(state): State<AppState>, Json(req): Json<CurrencySubmit>) -> Result<Response, ApiError> {
+async fn add_currency(
+    State(state): State<AppState>,
+    Json(req): Json<CurrencySubmit>,
+) -> Result<Response, ApiError> {
     let c = conn(&state)?;
     let name = req.name.trim().to_string();
     if name.is_empty() {
@@ -165,7 +196,10 @@ async fn add_counterparty(
     let c = conn(&state)?;
     let name = req.name.trim().to_string();
     if name.is_empty() {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "交易对象名称不能为空".into()));
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "交易对象名称不能为空".into(),
+        ));
     }
     let balance = req.balance.unwrap_or(Money::from_int(0));
     let id = db::add_counterparty(&c, &name, req.currency_id, balance)?;
@@ -174,13 +208,19 @@ async fn add_counterparty(
 }
 
 /// POST /api/groups — 添加一个组
-async fn add_group(State(state): State<AppState>, Json(req): Json<GroupSubmit>) -> Result<Response, ApiError> {
+async fn add_group(
+    State(state): State<AppState>,
+    Json(req): Json<GroupSubmit>,
+) -> Result<Response, ApiError> {
     let mut c = conn(&state)?;
     let name = req.name.trim().to_string();
     // 币种一致性校验（转出/转入对象货币必须相同且与金额货币一致）
     month::validate_no_cross_currency(&c, &req.records)?;
     let group_id = month::add_group(&mut c, &name, &req.records)?;
-    log::info!("添加交易组: group_id={group_id}, {} 条记录", req.records.len());
+    log::info!(
+        "添加交易组: group_id={group_id}, {} 条记录",
+        req.records.len()
+    );
     Ok(ok_json(json!({ "id": group_id, "name": name })))
 }
 
@@ -200,7 +240,10 @@ async fn add_record(
 // ---------- 删 ----------
 
 /// POST /api/currencies/delete — 删除货币
-async fn delete_currency(State(state): State<AppState>, Json(req): Json<DeleteRequest>) -> Result<Response, ApiError> {
+async fn delete_currency(
+    State(state): State<AppState>,
+    Json(req): Json<DeleteRequest>,
+) -> Result<Response, ApiError> {
     let c = conn(&state)?;
     match db::delete_currency(&c, req.id)? {
         true => {
@@ -215,7 +258,10 @@ async fn delete_currency(State(state): State<AppState>, Json(req): Json<DeleteRe
 }
 
 /// POST /api/counterparties/delete — 删除交易对象
-async fn delete_counterparty(State(state): State<AppState>, Json(req): Json<DeleteRequest>) -> Result<Response, ApiError> {
+async fn delete_counterparty(
+    State(state): State<AppState>,
+    Json(req): Json<DeleteRequest>,
+) -> Result<Response, ApiError> {
     let c = conn(&state)?;
     match db::delete_counterparty(&c, req.id)? {
         true => {
@@ -230,7 +276,10 @@ async fn delete_counterparty(State(state): State<AppState>, Json(req): Json<Dele
 }
 
 /// POST /api/groups/delete — 删除一个组
-async fn delete_group(State(state): State<AppState>, Json(req): Json<DeleteRequest>) -> Result<Response, ApiError> {
+async fn delete_group(
+    State(state): State<AppState>,
+    Json(req): Json<DeleteRequest>,
+) -> Result<Response, ApiError> {
     let c = conn(&state)?;
     let n = month::delete_group(&c, req.id)?;
     log::info!("删除组: group_id={}, 删除 {} 条记录", req.id, n);
@@ -281,8 +330,18 @@ async fn list_stats(State(state): State<AppState>) -> Result<Response, ApiError>
     let out: Vec<serde_json::Value> = list
         .iter()
         .map(|m| {
-            let income: Vec<_> = m.stats.income.iter().map(|(n, mo)| json!({ "currency": n, "amount": mo })).collect();
-            let expense: Vec<_> = m.stats.expense.iter().map(|(n, mo)| json!({ "currency": n, "amount": mo })).collect();
+            let income: Vec<_> = m
+                .stats
+                .income
+                .iter()
+                .map(|(n, mo)| json!({ "currency": n, "amount": mo }))
+                .collect();
+            let expense: Vec<_> = m
+                .stats
+                .expense
+                .iter()
+                .map(|(n, mo)| json!({ "currency": n, "amount": mo }))
+                .collect();
             json!({
                 "month": m.month,
                 "table_name": m.table_name,
@@ -295,23 +354,42 @@ async fn list_stats(State(state): State<AppState>) -> Result<Response, ApiError>
 }
 
 /// PUT /api/stats/month — 查指定月范围的收支统计（from/to 为 `YYYY-MM`，均可省略）
-async fn month_stats(State(state): State<AppState>, Json(req): Json<MonthQuery>) -> Result<Response, ApiError> {
+async fn month_stats(
+    State(state): State<AppState>,
+    Json(req): Json<MonthQuery>,
+) -> Result<Response, ApiError> {
     let c = conn(&state)?;
     let meta = db::list_month_stats(&c)?;
-    let filtered: Vec<_> = meta.into_iter().filter(|m| {
-        let in_from = req.from.as_ref().is_none_or(|f| &m.month >= f);
-        let in_to = req.to.as_ref().is_none_or(|t| &m.month <= t);
-        in_from && in_to
-    }).collect();
-    let out: Vec<serde_json::Value> = filtered.iter().map(|m| {
-        let income: Vec<_> = m.stats.income.iter().map(|(n, mo)| json!({ "currency": n, "amount": mo })).collect();
-        let expense: Vec<_> = m.stats.expense.iter().map(|(n, mo)| json!({ "currency": n, "amount": mo })).collect();
-        json!({
-            "month": m.month,
-            "income": income,
-            "expense": expense,
+    let filtered: Vec<_> = meta
+        .into_iter()
+        .filter(|m| {
+            let in_from = req.from.as_ref().is_none_or(|f| &m.month >= f);
+            let in_to = req.to.as_ref().is_none_or(|t| &m.month <= t);
+            in_from && in_to
         })
-    }).collect();
+        .collect();
+    let out: Vec<serde_json::Value> = filtered
+        .iter()
+        .map(|m| {
+            let income: Vec<_> = m
+                .stats
+                .income
+                .iter()
+                .map(|(n, mo)| json!({ "currency": n, "amount": mo }))
+                .collect();
+            let expense: Vec<_> = m
+                .stats
+                .expense
+                .iter()
+                .map(|(n, mo)| json!({ "currency": n, "amount": mo }))
+                .collect();
+            json!({
+                "month": m.month,
+                "income": income,
+                "expense": expense,
+            })
+        })
+        .collect();
     Ok(ok_json(out))
 }
 
@@ -319,9 +397,15 @@ async fn month_stats(State(state): State<AppState>, Json(req): Json<MonthQuery>)
 ///
 /// 返回结构：{ month, objects: [{ id, name, direction, currency, amount }] }
 /// direction 为 `income`（收入）/ `expense`（支出）/ `balance`（当前余额）。
-async fn object_stats(State(state): State<AppState>, Json(req): Json<ObjectStatsQuery>) -> Result<Response, ApiError> {
+async fn object_stats(
+    State(state): State<AppState>,
+    Json(req): Json<ObjectStatsQuery>,
+) -> Result<Response, ApiError> {
     if req.counterparty_ids.is_empty() {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "至少需要选择一个交易对象".into()));
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "至少需要选择一个交易对象".into(),
+        ));
     }
     let c = conn(&state)?;
     let data = month::compute_object_stats(&c, &req)?;
@@ -380,7 +464,8 @@ async fn query_records(state: &AppState, query: &RangeQuery) -> Result<Response,
     // 关联名称
     let cp = db::list_counterparties(&c)?;
     let currencies = db::list_currencies(&c)?;
-    let cp_map: std::collections::HashMap<i64, &Counterparty> = cp.iter().map(|x| (x.id, x)).collect();
+    let cp_map: std::collections::HashMap<i64, &Counterparty> =
+        cp.iter().map(|x| (x.id, x)).collect();
     let cur_map: std::collections::HashMap<i64, &Currency> =
         currencies.iter().map(|x| (x.id, x)).collect();
     let out: Vec<serde_json::Value> = list
@@ -390,6 +475,7 @@ async fn query_records(state: &AppState, query: &RangeQuery) -> Result<Response,
                 "id": r.id,
                 "group_id": r.group_id,
                 "group_name": r.group_name,
+                "group_months": r.group_months,
                 "from": cp_map.get(&r.from_id).map_or_else(|| "?".to_string(), |c| c.name.clone()),
                 "from_id": r.from_id,
                 "to": cp_map.get(&r.to_id).map_or_else(|| "?".to_string(), |c| c.name.clone()),
@@ -406,14 +492,23 @@ async fn query_records(state: &AppState, query: &RangeQuery) -> Result<Response,
 }
 
 /// PUT /api/records — 查一定时间范围的所有记录
-async fn list_records(State(state): State<AppState>, Json(query): Json<RangeQuery>) -> Result<Response, ApiError> {
+async fn list_records(
+    State(state): State<AppState>,
+    Json(query): Json<RangeQuery>,
+) -> Result<Response, ApiError> {
     query_records(&state, &query).await
 }
 
 /// PUT /api/records/object — 查指定交易对象的时间范围记录
-async fn object_records(State(state): State<AppState>, Json(query): Json<RangeQuery>) -> Result<Response, ApiError> {
+async fn object_records(
+    State(state): State<AppState>,
+    Json(query): Json<RangeQuery>,
+) -> Result<Response, ApiError> {
     if query.counterparty_id.is_none() {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "缺少 counterparty_id".into()));
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "缺少 counterparty_id".into(),
+        ));
     }
     query_records(&state, &query).await
 }
@@ -431,12 +526,3 @@ async fn list_currencies(State(state): State<AppState>) -> Result<Response, ApiE
     let list: Vec<Currency> = db::list_currencies(&c)?;
     Ok(ok_json(list))
 }
-
-// ---------- 便捷类型别名 ----------
-
-/// 组 ID 响应（与 Group 模型保持一致性）
-pub type GroupId = i64;
-
-/// 使 Group 可用（供外部引用）
-#[allow(dead_code)]
-fn _group_placeholder(_: Group) {}

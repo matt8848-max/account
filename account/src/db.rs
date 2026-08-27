@@ -17,9 +17,17 @@ pub mod month;
 pub const DB_FILE: &str = "account.db";
 
 /// 数据库 Schema 当前版本
-pub const DB_VERSION: i64 = 1;
+///
+/// 版本历史：
+/// - 1：初始版本（无结构变更，早期库视为版本 0 与之同构）
+/// - 2：月表新增 `group_months` 列，记录每个组包含哪些月份
+pub const DB_VERSION: i64 = 2;
 
-/// 打开（或创建）数据库并初始化表结构
+/// 打开（或创建）数据库并初始化表结构。
+///
+/// - **全新数据库**（无任何业务表）：直接创建当前版本 schema 并写入 `DB_VERSION`，
+///   避免"新建的库不是最新版本"。
+/// - **已有数据库**：按版本迁移规则升级（仅向下兼容一个版本，见 [`migrate`]）。
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("打开数据库失败")?;
     conn.execute_batch(
@@ -27,26 +35,134 @@ pub fn open(path: &Path) -> Result<Connection> {
          PRAGMA journal_mode = WAL;",
     )
     .context("设置数据库参数失败")?;
-    init_schema(&conn)?;
-    migrate(&conn)?;
+
+    // 判断是否为全新库：无任何业务表则直接建最新 schema
+    let has_tables: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name IN ('currencies','counterparties','total_stats'))",
+            [],
+            |r| r.get(0),
+        )
+        .context("检查数据库结构失败")?;
+
+    if !has_tables {
+        init_schema(&conn)?;
+        conn.execute_batch(&format!("PRAGMA user_version = {DB_VERSION};"))
+            .context("写入数据库版本号失败")?;
+        log::info!("新建数据库，schema 版本 = {DB_VERSION}");
+    } else {
+        migrate(&conn)?;
+    }
     Ok(conn)
 }
 
 /// 数据库版本迁移。
 ///
-/// 早期数据库没有版本控制，视为版本 0（即"最开始忘了版本控制的版本"）。
-/// 依次执行各版本迁移，最终将 `PRAGMA user_version` 更新为当前版本号。
+/// 升级规则：**只向下兼容一个版本的升级**——当前最新版本为 `N` 时，
+/// 仅允许从 `N-1` 升级到 `N`；读到更旧的版本（≤ `N-2`）拒绝升级，
+/// 防止跳过中间迁移导致数据结构不一致。
+///
+/// 特殊豁免：版本 0 是"最开始忘了版本控制的版本"，其表结构与版本 1 完全一致
+/// （版本 1 升级仅补齐版本号，无结构变更），因此版本 0 与 1 均允许升级到 2。
 pub fn migrate(conn: &Connection) -> Result<()> {
-    let version: i64 = conn
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .context("读取数据库版本失败")?;
-    // 版本 0 → 1：无实际结构变更，仅补齐版本号
-    if version < DB_VERSION {
-        conn.execute_batch(&format!("PRAGMA user_version = {DB_VERSION};"))
-            .context("写入数据库版本号失败")?;
-        log::info!("数据库版本迁移: {version} → {DB_VERSION}");
+    let version: i64 = db_version(conn)?;
+    if version == DB_VERSION {
+        return Ok(());
     }
+    // 0 与 1 结构相同，都视为可升级的"上一版本"；其余更旧版本拒绝
+    let expected = DB_VERSION - 1;
+    if version != 0 && version != expected {
+        return Err(anyhow::anyhow!(
+            "数据库版本 {version} 过旧：仅支持从版本 0/1（结构同 {expected}）升级到当前版本 {DB_VERSION}，请使用与新版本匹配的程序"
+        ));
+    }
+
+    // 1/0 → 2：月表新增 group_months 列（记录组包含哪些月份），并回填
+    migrate_v1_to_v2(conn)?;
+
+    conn.execute_batch(&format!("PRAGMA user_version = {DB_VERSION};"))
+        .context("写入数据库版本号失败")?;
+    log::info!("数据库版本迁移: {version} → {DB_VERSION}");
     Ok(())
+}
+
+/// 数据库版本 1/0 → 2 的迁移。
+///
+/// 1. 为所有已存在的月表 `transactions_YYYY_MM` 追加 `group_months TEXT` 列
+///    （存储该组包含的所有月份，逗号分隔，如 `2026-08,2026-09`）；
+/// 2. 按现有记录回填：对每个组聚合其在所有月表中的交易月份，写入该组各条记录。
+fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
+    let tables = existing_transaction_tables(conn)?;
+
+    // 1. 补列
+    for table in &tables {
+        let has: bool = conn
+            .query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name='group_months')"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if !has {
+            conn.execute_batch(&format!("ALTER TABLE `{table}` ADD COLUMN group_months TEXT;"))
+                .with_context(|| format!("旧月表 `{table}` 补加 group_months 列失败"))?;
+            log::info!("旧月表 `{table}` 已补加 group_months 列");
+        }
+    }
+
+    // 2. 回填：group_id → 涉及月份集合（跨所有月表聚合）
+    let mut group_months: std::collections::HashMap<i64, std::collections::BTreeSet<String>> =
+        std::collections::HashMap::new();
+    for table in &tables {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT group_id, traded_at FROM `{table}`"
+        ))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (gid, traded_at) = row?;
+            let month = month::month_of(&traded_at).to_string();
+            group_months.entry(gid).or_default().insert(month);
+        }
+    }
+
+    // 3. 写回
+    for (gid, months) in group_months {
+        if months.is_empty() {
+            continue;
+        }
+        let joined = months.iter().cloned().collect::<Vec<_>>().join(",");
+        for table in &tables {
+            conn.execute(
+                &format!("UPDATE `{table}` SET group_months = ?1 WHERE group_id = ?2"),
+                rusqlite::params![joined, gid],
+            )?;
+        }
+    }
+    log::info!(
+        "数据库迁移 1→2 完成：为 {} 个月表补充 group_months 并回填",
+        tables.len()
+    );
+    Ok(())
+}
+
+/// 列出所有已存在的月表名（`transactions_` 前缀）
+fn existing_transaction_tables(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT name FROM sqlite_master
+         WHERE type='table' AND name LIKE 'transactions_%' ORDER BY name",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 /// 查询当前数据库 schema 版本
@@ -93,6 +209,7 @@ pub fn ensure_month_table(conn: &Connection, month: &str) -> Result<String> {
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
             group_id       INTEGER NOT NULL,
             group_name     TEXT,
+            group_months   TEXT,
             from_id        INTEGER NOT NULL REFERENCES counterparties(id),
             to_id          INTEGER NOT NULL REFERENCES counterparties(id),
             amount_value   INTEGER NOT NULL,
@@ -103,8 +220,8 @@ pub fn ensure_month_table(conn: &Connection, month: &str) -> Result<String> {
         );"
     ))
     .with_context(|| format!("创建月表 `{table}` 失败"))?;
-    // 旧月表可能无 group_name 列，补上
-    let has: bool = conn
+    // 旧月表可能无 group_name / group_months 列，补上
+    let has_name: bool = conn
         .query_row(
             &format!(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name='group_name')"
@@ -113,9 +230,22 @@ pub fn ensure_month_table(conn: &Connection, month: &str) -> Result<String> {
             |r| r.get(0),
         )
         .unwrap_or(false);
-    if !has {
+    if !has_name {
         conn.execute_batch(&format!("ALTER TABLE `{table}` ADD COLUMN group_name TEXT;"))
             .with_context(|| format!("月表 `{table}` 补加 group_name 失败"))?;
+    }
+    let has_months: bool = conn
+        .query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name='group_months')"
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if !has_months {
+        conn.execute_batch(&format!("ALTER TABLE `{table}` ADD COLUMN group_months TEXT;"))
+            .with_context(|| format!("月表 `{table}` 补加 group_months 失败"))?;
     }
     Ok(table)
 }
@@ -381,10 +511,120 @@ mod tests {
     #[test]
     fn migrate_from_version_zero_sets_current() {
         let conn = test_conn();
-        // 模拟"最开始忘了版本控制的版本"：user_version 为 0
+        // 模拟"最开始忘了版本控制的版本"：user_version 为 0。
+        // 版本 0 与 1 结构相同，0 → 2 是合法升级（补列 group_months 并回填）。
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, 0);
         migrate(&conn).unwrap();
         assert_eq!(db_version(&conn).unwrap(), DB_VERSION);
+    }
+
+    /// 验证版本 1 → 2 的迁移：旧月表补加 group_months 列，并按已有记录回填
+    #[test]
+    fn migrate_v1_to_v2_backfills_group_months() {
+        let conn = test_conn();
+        // 构造版本 1 的旧月表（无 group_months 列）与旧数据
+        conn.execute_batch(
+            "CREATE TABLE transactions_2026_08 (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id       INTEGER NOT NULL,
+                group_name     TEXT,
+                from_id        INTEGER NOT NULL,
+                to_id          INTEGER NOT NULL,
+                amount_value   INTEGER NOT NULL,
+                amount_divisor INTEGER NOT NULL,
+                currency_id    INTEGER NOT NULL,
+                remark         TEXT,
+                traded_at      TEXT NOT NULL
+            );
+            CREATE TABLE transactions_2026_09 (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id       INTEGER NOT NULL,
+                group_name     TEXT,
+                from_id        INTEGER NOT NULL,
+                to_id          INTEGER NOT NULL,
+                amount_value   INTEGER NOT NULL,
+                amount_divisor INTEGER NOT NULL,
+                currency_id    INTEGER NOT NULL,
+                remark         TEXT,
+                traded_at      TEXT NOT NULL
+            );
+            INSERT INTO transactions_2026_08
+                (group_id, group_name, from_id, to_id, amount_value, amount_divisor, currency_id, remark, traded_at)
+                VALUES (1, NULL, 1, 2, 100, 1, 1, NULL, '2026-08-14T10:30:00'),
+                       (2, NULL, 1, 2, 50, 1, 1, NULL, '2026-08-02T08:00:00');
+            INSERT INTO transactions_2026_09
+                (group_id, group_name, from_id, to_id, amount_value, amount_divisor, currency_id, remark, traded_at)
+                VALUES (1, NULL, 1, 2, 30, 1, 1, NULL, '2026-09-05T08:00:00');
+            PRAGMA user_version = 1;",
+        )
+        .expect("构造版本 1 旧库");
+
+        migrate(&conn).unwrap();
+        assert_eq!(db_version(&conn).unwrap(), DB_VERSION);
+
+        // 组 1 跨 8、9 月 → group_months 应为逗号分隔升序；组 2 只在 8 月
+        let g1_aug: String = conn
+            .query_row(
+                "SELECT group_months FROM transactions_2026_08 WHERE group_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(g1_aug, "2026-08,2026-09");
+        let g1_sep: String = conn
+            .query_row(
+                "SELECT group_months FROM transactions_2026_09 WHERE group_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(g1_sep, "2026-08,2026-09");
+        let g2: String = conn
+            .query_row(
+                "SELECT group_months FROM transactions_2026_08 WHERE group_id = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(g2, "2026-08");
+    }
+
+    /// 验证升级规则：过旧版本（≤ DB_VERSION-2 且非 0）必须拒绝升级
+    #[test]
+    fn migrate_rejects_too_old_version() {
+        let conn = test_conn();
+        // 当前 DB_VERSION=2，允许升级的版本只有 0/1；-1 视为过旧，应报错
+        conn.execute_batch("PRAGMA user_version = -1;").unwrap();
+        let err = migrate(&conn).unwrap_err();
+        assert!(err.to_string().contains("过旧"));
+        // 版本未被改动
+        assert_eq!(db_version(&conn).unwrap(), -1);
+    }
+
+    /// 验证当前版本无需迁移（幂等）
+    #[test]
+    fn migrate_is_noop_when_current() {
+        let conn = test_conn();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(db_version(&conn).unwrap(), DB_VERSION);
+    }
+
+    /// 验证 open 新建的数据库直接是最新版本（而非版本 0）
+    #[test]
+    fn open_creates_new_db_at_current_version() {
+        let conn = open(Path::new(":memory:")).unwrap();
+        assert_eq!(db_version(&conn).unwrap(), DB_VERSION);
+        // 基本表结构已就绪
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name IN ('currencies','counterparties','total_stats')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 3);
     }
 }

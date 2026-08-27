@@ -52,7 +52,9 @@ pub fn validate_positive_amount(amount: &Money) -> Result<()> {
 
 /// 在事务中创建一个组并插入多条交易记录
 ///
-/// 组内每条记录根据其 `traded_at` 所属月份写入对应月表（组 ID 全局唯一递增）。
+/// 组内每条记录根据其 `traded_at` 所属月份写入对应月表。
+/// **组 ID 只从该组涉及的月份表中分配**（取涉及月份表 `MAX(group_id)+1`），
+/// 避免无关月份的历史大 ID 导致组 ID 快速膨胀、也避免全表扫描的性能问题。
 pub fn add_group(conn: &mut Connection, name: &str, records: &[RecordSubmit]) -> Result<i64> {
     validate_group_name(name)?;
     if records.is_empty() {
@@ -65,19 +67,52 @@ pub fn add_group(conn: &mut Connection, name: &str, records: &[RecordSubmit]) ->
         Some(name.trim().to_string())
     };
 
-    // 计算全局唯一组 ID：跨所有月表的最大 group_id + 1
-    let group_id = {
-        let mut max_id = 0i64;
-        for table in existing_month_tables(&tx)? {
-            let m: i64 = tx.query_row(
+    // 涉及月份集合（去重、有序）
+    let months: std::collections::BTreeSet<String> = records
+        .iter()
+        .map(|r| month_of(&r.traded_at).to_string())
+        .collect();
+
+    // 候选组 ID：该组涉及月份表中最大组 ID + 1（ensure 后表必然存在）。
+    // 注意取 `group_id` 列而非 `id` 列——`id` 是行号，同组多记录会使行号远大于组号，
+    // 会导致组 ID 随记录条数快速膨胀。
+    let mut group_id = {
+        let mut max_group_id = 0i64;
+        for m in &months {
+            let table = ensure_month_table(&tx, m)?;
+            let cur: i64 = tx.query_row(
                 &format!("SELECT COALESCE(MAX(group_id), 0) FROM `{table}`"),
                 [],
                 |r| r.get(0),
             )?;
-            max_id = max_id.max(m);
+            max_group_id = max_group_id.max(cur);
         }
-        max_id + 1
+        max_group_id + 1
     };
+
+    // 全局查重：部分删除后，旧组可能在未涉及月份残留同号记录。
+    // 候选值若已被任何月份表的现存组占用，则顺延，保证组 ID 全局唯一、删除不误伤。
+    loop {
+        let mut used = false;
+        for table in existing_month_tables(&tx)? {
+            let u: bool = tx.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM `{table}` WHERE group_id = ?1)"),
+                [group_id],
+                |r| r.get(0),
+            )?;
+            if u {
+                used = true;
+                break;
+            }
+        }
+        if !used {
+            break;
+        }
+        group_id += 1;
+    }
+
+    // 组包含的月份集合，逗号分隔（如 `2026-08,2026-09`），冗余写入该组每行
+    let group_months = months.iter().cloned().collect::<Vec<_>>().join(",");
 
     for rec in records {
         validate_remark(&rec.remark)?;
@@ -104,12 +139,13 @@ pub fn add_group(conn: &mut Connection, name: &str, records: &[RecordSubmit]) ->
         tx.execute(
             &format!(
                 "INSERT INTO `{table}`
-                 (group_id, group_name, from_id, to_id, amount_value, amount_divisor, currency_id, remark, traded_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+                 (group_id, group_name, group_months, from_id, to_id, amount_value, amount_divisor, currency_id, remark, traded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
             ),
             params![
                 group_id,
                 group_name,
+                group_months,
                 rec.from_id,
                 rec.to_id,
                 rec.amount.value,
@@ -128,6 +164,9 @@ pub fn add_group(conn: &mut Connection, name: &str, records: &[RecordSubmit]) ->
 }
 
 /// 往已存在的组内添加一条记录
+///
+/// 添加后重新计算该组包含的月份（跨所有月表聚合），
+/// 并回写该组各条记录的 `group_months` 列。
 pub fn add_record(
     conn: &Connection,
     month: &str,
@@ -166,13 +205,27 @@ pub fn add_record(
     .with_context(|| format!("插入月表 `{table}` 记录失败"))?;
     // 余额联动
     apply_balance(conn, rec)?;
+    // 重新聚合该组包含的月份，回写该组所有记录
+    refresh_group_months(conn, group_id)?;
     Ok(conn.last_insert_rowid())
 }
 
-/// 删除一个组及其全部记录（跨所有月表）
+/// 删除一个组及其全部记录。
+///
+/// 组 ID 只在该组涉及的月份内分配，删除时先定位实际包含该组的月表，
+/// 避免对无关月表发出无效的 SELECT/DELETE（配合 `add_group` 的分配逻辑）。
 pub fn delete_group(conn: &Connection, group_id: i64) -> Result<usize> {
     let mut deleted = 0usize;
     for table in existing_month_tables(conn)? {
+        // 该月表是否包含该组的记录
+        let has: bool = conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM `{table}` WHERE group_id = ?1)"),
+            [group_id],
+            |r| r.get(0),
+        )?;
+        if !has {
+            continue;
+        }
         // 删除前取出记录，用于反转余额
         let mut stmt = conn.prepare(&format!(
             "SELECT from_id, to_id, amount_value, amount_divisor
@@ -202,15 +255,15 @@ pub fn delete_record(conn: &Connection, month: &str, record_id: i64) -> Result<b
         Ok(t) => t,
         Err(_) => return Ok(false),
     };
-    // 删除前取出记录，用于反转余额
-    let rec: Option<(i64, i64, i64, u32)> = conn
+    // 删除前取出记录（含所属组），用于反转余额与刷新组月份
+    let rec: Option<(i64, i64, i64, i64, u32)> = conn
         .query_row(
             &format!(
-                "SELECT from_id, to_id, amount_value, amount_divisor
+                "SELECT group_id, from_id, to_id, amount_value, amount_divisor
                  FROM `{table}` WHERE id = ?1"
             ),
             [record_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .ok();
     let n = conn.execute(
@@ -218,11 +271,13 @@ pub fn delete_record(conn: &Connection, month: &str, record_id: i64) -> Result<b
         [record_id],
     )?;
     if n > 0
-        && let Some((from_id, to_id, value, divisor)) = rec
+        && let Some((gid, from_id, to_id, value, divisor)) = rec
     {
         // 反转：转出方加回、转入方减回
         adjust_counterparty_balance(conn, from_id, value, divisor)?;
         adjust_counterparty_balance(conn, to_id, -value, divisor)?;
+        // 记录可能被删掉而改变组的月份集合，重新聚合回写
+        refresh_group_months(conn, gid)?;
     }
     Ok(n > 0)
 }
@@ -233,7 +288,7 @@ pub fn list_records(conn: &Connection, query: &RangeQuery) -> Result<Vec<Record>
     let mut out = Vec::new();
     for table in tables {
         let mut sql = format!(
-            "SELECT id, group_id, group_name, from_id, to_id, amount_value, amount_divisor,
+            "SELECT id, group_id, group_name, group_months, from_id, to_id, amount_value, amount_divisor,
                     currency_id, remark, traded_at FROM `{table}` WHERE 1=1"
         );
         let mut conds: Vec<String> = Vec::new();
@@ -265,15 +320,16 @@ pub fn list_records(conn: &Connection, query: &RangeQuery) -> Result<Vec<Record>
                 id: r.get(0)?,
                 group_id: r.get(1)?,
                 group_name: r.get(2)?,
-                from_id: r.get(3)?,
-                to_id: r.get(4)?,
+                group_months: r.get(3)?,
+                from_id: r.get(4)?,
+                to_id: r.get(5)?,
                 amount: Money {
-                    value: r.get(5)?,
-                    divisor: r.get(6)?,
+                    value: r.get(6)?,
+                    divisor: r.get(7)?,
                 },
-                currency_id: r.get(7)?,
-                remark: r.get(8)?,
-                traded_at: r.get(9)?,
+                currency_id: r.get(8)?,
+                remark: r.get(9)?,
+                traded_at: r.get(10)?,
             })
         })?;
         for row in rows {
@@ -281,6 +337,38 @@ pub fn list_records(conn: &Connection, query: &RangeQuery) -> Result<Vec<Record>
         }
     }
     Ok(out)
+}
+
+/// 重新计算指定组包含的所有月份（跨所有月表聚合），
+/// 并回写该组各条记录的 `group_months` 列（逗号分隔，如 `2026-08,2026-09`）。
+///
+/// 该函数供 `add_record`/`delete_record` 在变更记录后调用，
+/// 保证 `group_months` 始终与真实记录一致。
+fn refresh_group_months(conn: &Connection, group_id: i64) -> Result<()> {
+    let mut months: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // 组可能跨多个（或当前不存在任何）月表
+    let tables = existing_month_tables(conn)?;
+    for table in &tables {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT traded_at FROM `{table}` WHERE group_id = ?1"
+        ))?;
+        let rows = stmt.query_map([group_id], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            months.insert(month_of(&row?).to_string());
+        }
+    }
+    if months.is_empty() {
+        // 组已无记录（删除最后一条），无需回写
+        return Ok(());
+    }
+    let joined = months.iter().cloned().collect::<Vec<_>>().join(",");
+    for table in tables {
+        conn.execute(
+            &format!("UPDATE `{table}` SET group_months = ?1 WHERE group_id = ?2"),
+            params![joined, group_id],
+        )?;
+    }
+    Ok(())
 }
 
 /// 校验一个组提交的记录来源（供 API 层调用，跨币种转账拒绝在 add_group 内进行）
@@ -601,17 +689,50 @@ mod tests {
         conn
     }
 
+    /// 验证月份解析：覆盖 2025-01 至 2030-12 的全部月份，
+    /// 尾随时/分/秒为随机生成，确保解析只看前 7 位字符，与具体时间值无关
     #[test]
     fn month_of_parses() {
-        assert_eq!(month_of("2026-08-14T10:30:00"), "2026-08");
+        use std::collections::BTreeSet;
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        // xorshift64* 简单伪随机数（确定性种子，测试结果可复现）
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            rng.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        for year in 2025..=2030 {
+            for month in 1..=12 {
+                let h = next() % 24;
+                let m = next() % 60;
+                let s = next() % 60;
+                let ts = format!("{year:04}-{month:02}-14T{h:02}:{m:02}:{s:02}");
+                let expected = format!("{year:04}-{month:02}");
+                assert_eq!(month_of(&ts), expected, "时间字符串 {ts} 应解析为 {expected}");
+                seen.insert(expected);
+            }
+        }
+        assert_eq!(seen.len(), 6 * 12, "应覆盖 2025-01 至 2030-12 共 72 个月");
     }
 
+    /// 验证备注长度限制：256 字符内通过、257 字符拒绝。
+    /// 使用 ASCII 字符 `a` 测试，避免中文字符在 SQLite 中字符数统计的误解。
     #[test]
     fn validate_remark_length() {
         assert!(validate_remark(&None).is_ok());
         assert!(validate_remark(&Some("短备注".into())).is_ok());
-        let long = "长".repeat(257);
-        assert!(validate_remark(&Some(long)).is_err());
+        assert!(validate_remark(&Some("a".repeat(256))).is_ok());
+        let too_long = "a".repeat(257);
+        assert!(validate_remark(&Some(too_long)).is_err());
+    }
+
+    /// 验证组名长度边界：64 字符通过、65 字符拒绝（使用 ASCII 字符）
+    #[test]
+    fn group_name_length_boundary_ascii() {
+        assert!(validate_group_name(&"a".repeat(64)).is_ok());
+        assert!(validate_group_name(&"a".repeat(65)).is_err());
     }
 
     #[test]
@@ -630,7 +751,7 @@ mod tests {
     #[test]
     fn add_group_inserts_records() {
         let mut conn = setup();
-        // 注意：内存库不可行，setup 用的临时文件；此处确保表存在
+        // 内存库直接创建月表
         let _ = ensure_month_table(&conn, "2026-08").unwrap();
         let recs = vec![RecordSubmit {
             from_id: 1,
@@ -876,5 +997,232 @@ mod tests {
         add_group(&mut conn, "整数组", &recs2).unwrap();
         assert_eq!(balance_of(&conn, 1), Money { value: -10350, divisor: 100 });
         assert_eq!(balance_of(&conn, 2), Money { value: 10350, divisor: 100 });
+    }
+
+    // ---------- 组 ID 分配范围测试 ----------
+    //
+    // 验证问题清单第 5 项：组 ID 只从该组涉及的月份表中分配，
+    // 删除逻辑仅在包含该组的月表上操作。
+
+    /// 验证组 ID 优先从该组涉及的月份表中分配（避免无关月份历史 ID 造成膨胀），
+    /// 同时**全局查重**：候选值若已被任何现存组占用则顺延，
+    /// 防止部分删除后残留组与新组同号导致误删。
+    /// 本例 8 月建 5 组（group_id=1..5），9 月新组候选 = 9 月 MAX(group_id)+1 = 1，
+    /// 被 1..5 占用后顺延为 6。
+    #[test]
+    fn group_id_allocated_within_involved_months() {
+        let mut conn = setup();
+        // 8 月建 5 个组，使 8 月表 id/group_id 增长到 5
+        for i in 1..=5 {
+            let recs = vec![rec(
+                1,
+                2,
+                Money::from_int(10),
+                &format!("2026-08-0{i}T08:00:00"),
+            )];
+            add_group(&mut conn, &format!("八月组{i}"), &recs).unwrap();
+        }
+        // 新建只涉 9 月的组：候选 = 9 月 MAX(group_id)+1 = 1，
+        // 候选 1 与 8 月的 group_id=1..5 冲突，顺延到第一个空闲的 6
+        let gid = add_group(
+            &mut conn,
+            "九月组",
+            &[rec(1, 2, Money::from_int(5), "2026-09-01T08:00:00")],
+        )
+        .unwrap();
+        assert_eq!(gid, 6);
+    }
+
+    /// 验证候选组 ID 基于 `MAX(group_id)` 而非 `MAX(id)`：
+    /// 同一组含多条记录时，行号 `id` 会比组号 `group_id` 大很多，
+    /// 若误取 `MAX(id)` 会导致后续组 ID 随记录条数快速膨胀。
+    /// 本例第一个组 3 条记录（id=1..3、group_id=1），
+    /// 第二个组候选应为 `MAX(group_id)+1 = 2`，而非 `MAX(id)+1 = 4`。
+    #[test]
+    fn group_id_uses_group_id_column_not_row_id() {
+        let mut conn = setup();
+        // 第一个组含 3 条记录：表内 id=1、2、3，group_id=1
+        let recs = vec![
+            rec(1, 2, Money::from_int(10), "2026-08-01T08:00:00"),
+            rec(2, 1, Money::from_int(5), "2026-08-02T08:00:00"),
+            rec(1, 2, Money::from_int(7), "2026-08-03T08:00:00"),
+        ];
+        add_group(&mut conn, "多记录组", &recs).unwrap();
+
+        // 第二个组：候选 = MAX(group_id)+1 = 2（若误用 MAX(id) 会错误地得到 4）
+        let gid = add_group(
+            &mut conn,
+            "第二组",
+            &[rec(1, 2, Money::from_int(3), "2026-08-04T08:00:00")],
+        )
+        .unwrap();
+        assert_eq!(gid, 2);
+    }
+
+    // ---------- 组包含月份（group_months）测试 ----------
+
+    /// 验证新建组写入 group_months：单月组记录其月份，跨月组记录全部涉及月份（逗号分隔、升序）
+    #[test]
+    fn group_months_written_on_create() {
+        let mut conn = setup();
+        // 单月组：2026-08
+        let g1 = add_group(
+            &mut conn,
+            "单月组",
+            &[rec(1, 2, Money::from_int(10), "2026-08-10T08:00:00")],
+        )
+        .unwrap();
+        // 跨月组：2026-07 + 2026-08
+        let g2 = add_group(
+            &mut conn,
+            "跨月组",
+            &[
+                rec(1, 2, Money::from_int(5), "2026-07-31T23:00:00"),
+                rec(1, 2, Money::from_int(5), "2026-08-01T08:00:00"),
+            ],
+        )
+        .unwrap();
+
+        let list = list_records(&conn, &RangeQuery::default()).unwrap();
+        let g1_rows: Vec<_> = list.iter().filter(|r| r.group_id == g1).collect();
+        for r in &g1_rows {
+            assert_eq!(r.group_months.as_deref(), Some("2026-08"));
+        }
+        let g2_rows: Vec<_> = list.iter().filter(|r| r.group_id == g2).collect();
+        assert_eq!(g2_rows.len(), 2);
+        for r in &g2_rows {
+            assert_eq!(r.group_months.as_deref(), Some("2026-07,2026-08"));
+        }
+    }
+
+    /// 验证往组内追加跨月记录后，group_months 自动更新为包含新月份
+    #[test]
+    fn group_months_refreshed_on_add_record() {
+        let mut conn = setup();
+        let gid = add_group(
+            &mut conn,
+            "八月组",
+            &[rec(1, 2, Money::from_int(10), "2026-08-10T08:00:00")],
+        )
+        .unwrap();
+        // 追加 9 月记录
+        add_record(
+            &conn,
+            "2026-09",
+            gid,
+            &rec(1, 2, Money::from_int(5), "2026-09-05T08:00:00"),
+        )
+        .unwrap();
+
+        let list = list_records(&conn, &RangeQuery::default()).unwrap();
+        for r in list.iter().filter(|r| r.group_id == gid) {
+            assert_eq!(r.group_months.as_deref(), Some("2026-08,2026-09"));
+        }
+    }
+
+    /// 验证删除某月记录后，group_months 自动缩水为剩余月份
+    #[test]
+    fn group_months_refreshed_on_delete_record() {
+        let mut conn = setup();
+        let _gid = add_group(
+            &mut conn,
+            "跨月组",
+            &[
+                rec(1, 2, Money::from_int(5), "2026-08-10T08:00:00"),
+                rec(1, 2, Money::from_int(5), "2026-09-05T08:00:00"),
+            ],
+        )
+        .unwrap();
+        // 删除 8 月记录，剩余 9 月
+        let list = list_records(&conn, &RangeQuery::default()).unwrap();
+        let aug = list.iter().find(|r| r.traded_at.starts_with("2026-08")).unwrap();
+        assert!(delete_record(&conn, "2026-08", aug.id).unwrap());
+
+        let remaining = list_records(&conn, &RangeQuery::default()).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].group_months.as_deref(), Some("2026-09"));
+    }
+
+    /// 验证组 ID 冲突时顺延：候选值与旧组（可能残留在其他月份）冲突时，
+    /// 自动顺延到未使用的组 ID，保证删除组时不误删其他组
+    #[test]
+    fn group_id_avoids_reusing_existing_group_ids() {
+        let mut conn = setup();
+        // 8 月建组：候选 1，因此 8 月存在 group_id=1
+        add_group(
+            &mut conn,
+            "八月组",
+            &[rec(1, 2, Money::from_int(10), "2026-08-01T08:00:00")],
+        )
+        .unwrap();
+        // 9 月建第一个组：候选 1 与 8 月 group_id=1 冲突 → 顺延为 2
+        let gid1 = add_group(
+            &mut conn,
+            "九月组1",
+            &[rec(1, 2, Money::from_int(5), "2026-09-01T08:00:00")],
+        )
+        .unwrap();
+        assert_eq!(gid1, 2);
+        // 再建第二个 9 月组：候选 = 9 月 MAX(group_id)+1 = 2，与刚建的组冲突 → 顺延为 3
+        let gid2 = add_group(
+            &mut conn,
+            "九月组2",
+            &[rec(1, 2, Money::from_int(5), "2026-09-02T08:00:00")],
+        )
+        .unwrap();
+        assert_eq!(gid2, 3);
+
+        // 删除 8 月的组后，8 月不再占用 group_id=1；新组候选 1 可复用
+        delete_group(&conn, 1).unwrap();
+        let gid3 = add_group(
+            &mut conn,
+            "新八月组",
+            &[rec(1, 2, Money::from_int(5), "2026-08-02T08:00:00")],
+        )
+        .unwrap();
+        assert_eq!(gid3, 1);
+    }
+
+    /// 验证部分删除后残留组不被误删：
+    /// 组 A 跨 8、9 月；删除 8 月记录后残留 9 月记录。
+    /// 新组若候选与残留组 ID 相同会顺延，因此删除新组不会波及残留组。
+    #[test]
+    fn delete_group_does_not_touch_partial_residual_group() {
+        let mut conn = setup();
+        // 组 A：8 月 id=1/group_id=1，9 月 id=1/group_id=1
+        let recs_a = vec![
+            rec(1, 2, Money::from_int(10), "2026-08-01T08:00:00"),
+            rec(1, 2, Money::from_int(20), "2026-09-01T08:00:00"),
+        ];
+        let ga = add_group(&mut conn, "跨月组A", &recs_a).unwrap();
+
+        // 删除组 A 在 8 月的单条记录 → 组 A 残留 9 月记录（group_id=1）
+        let list = list_records(&conn, &RangeQuery::default()).unwrap();
+        let aug_rec = list
+            .iter()
+            .find(|r| r.group_id == ga && r.traded_at.starts_with("2026-08"))
+            .unwrap();
+        assert!(delete_record(&conn, "2026-08", aug_rec.id).unwrap());
+
+        // 新建只涉 8 月的组：候选 = 8 月 MAX(group_id)+1 = 1，与残留组 A 的 group_id=1 冲突 → 顺延 2
+        let gb = add_group(
+            &mut conn,
+            "新八月组B",
+            &[rec(1, 2, Money::from_int(5), "2026-08-02T08:00:00")],
+        )
+        .unwrap();
+        assert_eq!(gb, 2);
+
+        // 删除新组 B（group_id=2）：不得误删残留组 A（group_id=1 的 9 月记录）
+        let n = delete_group(&conn, gb).unwrap();
+        assert_eq!(n, 1, "新组 B 只有 1 条记录");
+        let remaining = list_records(&conn, &RangeQuery::default()).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].group_id, ga, "残留组 A 的记录应保留");
+        assert!(remaining[0].traded_at.starts_with("2026-09"));
+        // 删除残留组 A：应删掉其 9 月记录
+        let n2 = delete_group(&conn, ga).unwrap();
+        assert_eq!(n2, 1);
+        assert!(list_records(&conn, &RangeQuery::default()).unwrap().is_empty());
     }
 }
