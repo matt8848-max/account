@@ -29,7 +29,7 @@
 ├── CLAUDE.md
 ├── 构思.md              ← 原始需求设计文档
 ├── README.md            ← 用户手册（含运行方式）
-├── 更新日志.md          ← CHANGELOG（0.1.0 → 0.2.0）
+├── 更新日志.md          ← CHANGELOG（0.1.0 → 0.2.1）
 └── account/             # 单包双 bin（server + client 共享代码）
     ├── Cargo.toml
     ├── bin/
@@ -44,7 +44,7 @@
         └── ui.rs        ← 客户端 UI 公共父模块（全局状态、HTTP 封装、Toast、确认弹窗、主布局）
         └── ui/
             ├── connect.rs  ← 连接页（含「关闭服务器」按钮）
-            ├── records.rs  ← 交易记录浏览器（删除记录/组有确认弹窗）
+            ├── records.rs  ← 交易记录浏览器（删除记录/组有确认弹窗；进入页面自动刷新）
             ├── master.rs   ← 交易对象/货币管理（删除有确认弹窗）
             └── stats.rs    ← 数据统计
 ```
@@ -64,8 +64,10 @@
 - 所有增删改查均以后端成功响应为准再更新前端显示，未指定处理方式的失败弹 Toast 警告
 - 交易对象/货币在增删成功后自动更新内存缓存
 - **余额联动**：新增组/记录时转出方余额减、转入方余额加（事务内）；删除组/记录时反转（转出方加回、转入方减回）。前端在创建组/删除记录/删除组成功后自动重新拉取交易对象列表，实时展示最新余额
-- **组包含月份**：组创建时计算其涉及的月份集合，以逗号分隔字符串冗余写入该组每条记录的 `group_months` 列；`add_record`/`delete_record` 后自动重算回写（`refresh_group_months`）
+- **组包含月份**：组创建时计算其涉及的月份集合，以逗号分隔字符串冗余写入该组每条记录的 `group_months` 列；`add_record`/`delete_record` 后自动重算回写（`refresh_group_months`，按组实例定位，禁止全局扫描）
 - **跨币种禁止**：转出对象与转入对象的货币必须相同，且金额货币必须与对象货币一致（`month::validate_no_cross_currency`）
+- **交易记录页进入时自动刷新**：从其他页切回交易记录页时，挂载即主动拉取记录，无需手动操作
+- **默认查询范围近 7 天**：应用启动时交易记录页 `query_from` 默认为当前时间往前 7 天、`query_to` 默认为当前时间（避免默认拉取全部记录）
 - 统计必须选择至少一个交易对象；月份范围用原生 `month` 型输入框
 - 最外层容器用 `height:100dvh; overflow:hidden`，内容区由 `main` 自行滚动，避免桌面/网页出现多余滚动条
 
@@ -100,7 +102,7 @@ SQLite 单文件数据库，按月分表。核心规则：
 | 字段 | 说明 |
 |---|---|
 | id | 主键 |
-| group_id | 组 ID（该组涉及的月份内分配，全局查重顺延） |
+| group_id | 组 ID（从该组涉及的月份表中取最小未使用正整数；不同月份的组可复用同号） |
 | group_name | 组名称（最多 64 字符，可为空） |
 | group_months | 组包含的所有月份（逗号分隔，如 `2026-08,2026-09`） |
 | from_id | 转出交易对象（FK → counterparties） |
@@ -113,7 +115,7 @@ SQLite 单文件数据库，按月分表。核心规则：
 
 **组的概念**：一条交易可能被细分为多条具体操作。例如微信钱包提现 300 元收手续费，会产生微信钱包→微信交易、微信钱包→银行卡两条记录，同属一个组。组内每条记录遵循会计约定：**转入、转出、金额**三要素 + 可选的备注。
 
-**组 ID 分配**：只从该组涉及的月份表中分配（取涉及月 `MAX(id)+1`），再全局查重防误删；避免无关月份历史大 ID 导致快速膨胀。
+**组 ID 分配**：从该组涉及的月份表中取**最小未使用的正整数**（如新组跨 9/10 月，则取 9、10 月表中都未出现的最小正整数）。不同月份的组可复用相同 group_id——只要 group_months 不重叠，删除组/加记录时按月份定位即可互不影响，避免跨月组导致组 ID 虚高。
 
 **时间语义**：月表存储的是**交易时间**（`traded_at`）而非创建时间——所有交易均为手动记录，不存在自动录入场景；时间精确到秒。
 
@@ -156,7 +158,8 @@ SQLite 单文件数据库，按月分表。核心规则：
 - 名称不可修改，防止引用不一致
 - 交易对象 `UNIQUE(name, currency_id)` 复合唯一
 - 组名为可选字符串（≤64 字符），空名存 NULL；记录列表回退显示 `组#ID`
-- 组包含月份 `group_months` 冗余存储，记录变更后必须重新聚合回写，保证与真实记录一致
+- **同 group_id 可在不同月份的组间复用**（group_months 不重叠）；删除组/加记录时按 `group_months` 定位组实例，避免误删同号其他月的组
+- 组包含月份 `group_months` 冗余存储，记录变更后必须重新聚合回写（按组实例定位，禁止全局扫描），保证与真实记录一致
 
 ## API 规范
 
@@ -179,7 +182,7 @@ SQLite 单文件数据库，按月分表。核心规则：
 | POST | `/api/currencies` | 添加货币 |
 | POST | `/api/counterparties` | 添加交易对象 |
 | POST | `/api/groups` | 添加一个组 |
-| POST | `/api/groups/{group_id}/records` | 往组内添加一条交易记录 |
+| POST | `/api/groups/{group_id}/records` | 往组内添加一条交易记录（请求体为 RecordSubmit 字段 + 可选 `group_months` 定位组实例） |
 
 ### 删（POST）
 
@@ -187,7 +190,7 @@ SQLite 单文件数据库，按月分表。核心规则：
 |---|---|---|
 | POST | `/api/currencies/delete` | 删除货币（须未被使用） |
 | POST | `/api/counterparties/delete` | 删除交易对象（须未被使用） |
-| POST | `/api/groups/delete` | 删除一个组 |
+| POST | `/api/groups/delete` | 删除一个组（请求体 `{ "id": group_id, "group_months": "2026-08,2026-09" }`，按月份定位组实例，避免误删同号其他月组） |
 | POST | `/api/records/delete` | 删除一条交易记录 |
 
 ### 查（PUT）
@@ -221,9 +224,9 @@ SQLite 单文件数据库，按月分表。核心规则：
 
 跨页公用的代码保留在 `ui.rs`（父模块）；**每页 UI 分别存于 `ui/` 子目录**（类似 `db.rs` + `db/month.rs`）：
 
-- `ui.rs`：全局状态（`GlobalState`）、HTTP 封装（`http_put/http_post`）、平台差异封装（sleep/now_str/提示）、`DayTimeInput`、`ConfirmDialog`、`MainLayout`、根 `App`
+- `ui.rs`：全局状态（`GlobalState`）、HTTP 封装（`http_put/http_post`）、平台差异封装（sleep/now_str/提示）、`DayTimeInput`、`SearchSelect`（搜索+候选选择组件，支持 `↑`/`↓` 移动高亮、`Enter` 确认、`empty_label` 插入「全部」项）、`ConfirmDialog`、`MainLayout`、根 `App`
 - `ui/connect.rs`：连接页（含关闭服务器按钮）
-- `ui/records.rs`：交易记录浏览器
+- `ui/records.rs`：交易记录浏览器（挂载时自动刷新；行格式：时间 转出→转入 金额 货币 备注 删除条目按钮 组名 删除组按钮；新建组行的转出/转入、顶部「对象」筛选均用 `SearchSelect` 搜索选择）
 - `ui/master.rs`：交易对象/货币管理
 - `ui/stats.rs`：数据统计
 
@@ -275,7 +278,7 @@ cargo install dioxus-cli --version 0.7.9
 ## 代码规范
 
 - 前后端均使用日志库（log + env_logger），通过 `RUST_LOG` 控制级别；异步场景使用 tokio
-- 核心逻辑必须编写单元测试：金额定点数运算、月度统计聚合、API 参数校验、货币/对象删除约束、组 ID 分配、group_months 维护、数据库迁移
+- 核心逻辑必须编写单元测试：金额定点数运算、月度统计聚合、API 参数校验、货币/对象删除约束、组 ID 分配（含跨月复用与按月份定位删除）、group_months 维护、数据库迁移
 - **测试必须使用 SQLite 内存库**（`Connection::open_in_memory()` + 手动建 schema），不得在项目目录产生临时 db 文件；且天然规避并行测试锁冲突
 - 数据库访问统一收敛到 `db/` 数据访问层，禁止在 API 层直接写 SQL
 - 金额一律用定点数 `(value, divisor)` 两个整数，禁止 f32/f64

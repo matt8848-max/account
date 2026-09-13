@@ -225,14 +225,26 @@ async fn add_group(
 }
 
 /// POST /api/groups/{group_id}/records — 往组内添加一条记录
+///
+/// 请求体为 `RecordSubmit` 字段 + 可选 `group_months`（该组当前包含的月份，
+/// 逗号分隔，用于定位组实例；新方案下同 group_id 可在不同月份的组间复用）。
 async fn add_record(
     State(state): State<AppState>,
     axum::extract::Path(group_id): axum::extract::Path<i64>,
-    Json(req): Json<RecordSubmit>,
+    Json(req): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
     let c = conn(&state)?;
-    let month = month::month_of(&req.traded_at).to_string();
-    let id = month::add_record(&c, &month, group_id, &req)?;
+    let traded_at = req["traded_at"]
+        .as_str()
+        .ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "缺少 traded_at".into()))?;
+    let month = month::month_of(traded_at).to_string();
+    let group_months = req
+        .get("group_months")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let rec: RecordSubmit = serde_json::from_value(req.clone())
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "记录格式不正确".into()))?;
+    let id = month::add_record(&c, &month, group_id, group_months.as_deref(), &rec)?;
     log::info!("添加记录: id={id}, group_id={group_id}");
     Ok(ok_json(json!({ "id": id, "group_id": group_id })))
 }
@@ -276,13 +288,24 @@ async fn delete_counterparty(
 }
 
 /// POST /api/groups/delete — 删除一个组
+///
+/// 请求体：`{ "id": group_id, "group_months": "2026-08,2026-09" }`。
+/// `group_months` 为该组当前包含的月份（逗号分隔），用于定位组实例——
+/// 新方案下同 group_id 可在不同月份的组间复用，必须按月份删除，避免误删同号组。
 async fn delete_group(
     State(state): State<AppState>,
-    Json(req): Json<DeleteRequest>,
+    Json(req): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
     let c = conn(&state)?;
-    let n = month::delete_group(&c, req.id)?;
-    log::info!("删除组: group_id={}, 删除 {} 条记录", req.id, n);
+    let id = req["id"]
+        .as_i64()
+        .ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "缺少组 id".into()))?;
+    let group_months = req
+        .get("group_months")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let n = month::delete_group(&c, id, group_months.as_deref())?;
+    log::info!("删除组: group_id={id}, 删除 {} 条记录", n);
     Ok(ok_json(json!({ "deleted": n > 0, "count": n })))
 }
 

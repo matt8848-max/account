@@ -40,6 +40,8 @@ pub struct RecordView {
     pub id: i64,
     pub group_id: i64,
     pub group_name: Option<String>,
+    /// 组包含的所有月份（逗号分隔，如 `2026-08,2026-09`）
+    pub group_months: Option<String>,
     pub from: String,
     pub to: String,
     pub amount: Money,
@@ -150,6 +152,24 @@ pub(crate) fn now_local_iso() -> String {
     }
 }
 
+/// 当前时间往前 7 天（datetime-local 格式，无秒）
+///
+/// 用作交易记录页默认查询起始时间（近 7 天范围）。
+pub(crate) fn now_minus_7d_iso() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        (chrono::Utc::now() - chrono::Duration::days(7))
+            .format("%Y-%m-%dT%H:%M")
+            .to_string()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        (chrono::Local::now() - chrono::Duration::days(7))
+            .format("%Y-%m-%dT%H:%M")
+            .to_string()
+    }
+}
+
 /// datetime-local 值转后端 ISO 字符串（补秒）
 pub(crate) fn build_iso(dt: &str) -> String {
     let dt = dt.trim();
@@ -162,7 +182,11 @@ pub(crate) fn build_iso(dt: &str) -> String {
 
 /// 后端 ISO 时间转为 datetime-local 显示值（去掉秒）
 pub(crate) fn dt_local(v: &str) -> String {
-    if v.len() >= 16 { v[..16].to_string() } else { v.to_string() }
+    if v.len() >= 16 {
+        v[..16].to_string()
+    } else {
+        v.to_string()
+    }
 }
 
 /// 24 小时制时间输入：日期 + 时(00-23) + 分(00-59)
@@ -172,9 +196,21 @@ pub(crate) fn dt_local(v: &str) -> String {
 /// `value` 约定为 `YYYY-MM-DDTHH:MM`（无秒），变更时通过 `onchange` 回传。
 #[component]
 pub(crate) fn DayTimeInput(value: String, onchange: EventHandler<String>) -> Element {
-    let date = if value.len() >= 10 { value[..10].to_string() } else { String::new() };
-    let hour = if value.len() >= 13 { value[11..13].to_string() } else { "00".to_string() };
-    let minute = if value.len() >= 16 { value[14..16].to_string() } else { "00".to_string() };
+    let date = if value.len() >= 10 {
+        value[..10].to_string()
+    } else {
+        String::new()
+    };
+    let hour = if value.len() >= 13 {
+        value[11..13].to_string()
+    } else {
+        "00".to_string()
+    };
+    let minute = if value.len() >= 16 {
+        value[14..16].to_string()
+    } else {
+        "00".to_string()
+    };
     let hours: Vec<String> = (0..24).map(|h| format!("{h:02}")).collect();
     let minutes: Vec<String> = (0..60).map(|m| format!("{m:02}")).collect();
     // String 非 Copy，需 clone 供不同闭包捕获；
@@ -235,6 +271,130 @@ pub(crate) fn DayTimeInput(value: String, onchange: EventHandler<String>) -> Ele
     }
 }
 
+/// 搜索 + 候选选择组件
+///
+/// 原生 `<select>` 不支持搜索，此组件提供输入框关键字过滤 + 候选列表选择：
+/// - 点击/聚焦输入框展开候选下拉
+/// - 输入关键字实时过滤候选（按标签子串匹配，忽略大小写）
+/// - 支持键盘操作：`↑`/`↓` 移动高亮，`Enter` 确认选择
+/// - 点击候选选中并回填，关闭下拉
+/// - 未匹配时显示「无匹配候选」
+///
+/// `candidates` 为 `(值, 标签)` 列表；`value` 为当前选中值；
+/// `empty_label` 提供时，候选顶部插入 `(0, empty_label)` 项（用于「全部」筛选）；
+/// 选择后回调 `onchange`。
+#[component]
+pub(crate) fn SearchSelect(
+    candidates: Vec<(i64, String)>,
+    value: i64,
+    placeholder: String,
+    empty_label: Option<String>,
+    onchange: EventHandler<i64>,
+) -> Element {
+    // 下拉是否展开
+    let mut open = use_signal(|| false);
+    // 搜索文本
+    let mut query = use_signal(String::new);
+    // 键盘高亮索引
+    let mut highlight = use_signal(|| 0usize);
+
+    // 完整候选：可选在顶部插入「全部」项（值 0）
+    let mut all_candidates: Vec<(i64, String)> = Vec::new();
+    if let Some(label) = empty_label {
+        all_candidates.push((0, label));
+    }
+    all_candidates.extend(candidates);
+
+    // 当前选中项标签（用于输入框展示；搜索中则展示搜索词）
+    let selected_label = all_candidates
+        .iter()
+        .find(|(id, _)| *id == value)
+        .map(|(_, label)| label.clone())
+        .unwrap_or_default();
+
+    // 过滤候选：按标签子串匹配（忽略大小写）
+    let q = query().to_lowercase();
+    let filtered: Vec<(i64, String)> = all_candidates
+        .iter()
+        .filter(|(_, label)| q.is_empty() || label.to_lowercase().contains(&q))
+        .cloned()
+        .collect();
+
+    // 高亮索引（渲染时收敛到有效范围，避免过滤后越界）
+    let highlight_idx = {
+        let h = (highlight)();
+        if filtered.is_empty() {
+            0
+        } else {
+            h.min(filtered.len() - 1)
+        }
+    };
+    let filtered_len = filtered.len();
+    // 键盘闭包需要 filtered 的副本：读取选中项
+    let filtered_for_keys = filtered.clone();
+
+    rsx! {
+        div { style: "position:relative;display:inline-block;min-width:150px;vertical-align:middle",
+            input {
+                value: if query().is_empty() { selected_label } else { query() },
+                placeholder: placeholder,
+                oninput: move |e| {
+                    query.set(e.value());
+                    open.set(true);
+                },
+                onclick: move |_| open.set(true),
+                onfocus: move |_| open.set(true),
+                onkeydown: move |e| {
+                    let code = e.code().to_string();
+                    if code == "ArrowDown" || code == "ArrowUp" {
+                        e.prevent_default();
+                        if filtered_len == 0 { return; }
+                        let cur = (highlight)().min(filtered_len - 1);
+                        let next = if code == "ArrowDown" {
+                            (cur + 1) % filtered_len
+                        } else {
+                            (cur + filtered_len - 1) % filtered_len
+                        };
+                        highlight.set(next);
+                    } else if code == "Enter" {
+                        e.prevent_default();
+                        if filtered_len == 0 { return; }
+                        let cur = (highlight)().min(filtered_len - 1);
+                        if let Some((id, _)) = filtered_for_keys.get(cur) {
+                            onchange.call(*id);
+                        }
+                        query.set(String::new());
+                        open.set(false);
+                    }
+                },
+            }
+            if open() {
+                div {
+                    style: "position:absolute;top:100%;left:0;right:0;background:#fff;border:1px solid #ccc;border-radius:4px;max-height:200px;overflow:auto;z-index:500;box-shadow:0 2px 8px rgba(0,0,0,0.15)",
+                    for (idx, (id, label)) in filtered.iter().cloned().enumerate() {
+                        div {
+                            style: format!(
+                                "padding:4px 8px;cursor:pointer;background:{}",
+                                if idx == highlight_idx || id == value { "#eef" } else { "#fff" }
+                            ),
+                            onclick: move |_| {
+                                onchange.call(id);
+                                query.set(String::new());
+                                open.set(false);
+                            },
+                            onmouseover: move |_| highlight.set(idx),
+                            "{label}"
+                        }
+                    }
+                    if filtered.is_empty() {
+                        div { style: "padding:4px 8px;color:#999", "无匹配候选" }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// 交易对象下拉标签：名称 (货币)
 pub(crate) fn cp_label(c: &Counterparty, currencies: &[Currency]) -> String {
     let cur = currencies
@@ -268,7 +428,11 @@ pub(crate) fn parse_money(s: &str) -> Option<Money> {
     if !frac_part.chars().all(|c| c.is_ascii_digit()) || frac_part.len() > 6 {
         return None;
     }
-    let divisor = if frac_part.is_empty() { 1u32 } else { 10u32.pow(frac_part.len() as u32) };
+    let divisor = if frac_part.is_empty() {
+        1u32
+    } else {
+        10u32.pow(frac_part.len() as u32)
+    };
     let int_val: i64 = int_part.parse().ok()?;
     let mut value = int_val.checked_mul(divisor as i64)?;
     if !frac_part.is_empty() {
@@ -492,6 +656,11 @@ pub(crate) fn ConfirmDialog(
 
 #[component]
 pub fn App() -> Element {
+    const GLOBAL_CSS: &str = "
+        html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
+        *, *::before, *::after { box-sizing: border-box; }
+    ";// 人工修复了一个UIbug,用于修复错误的高度占用所导致的UI bug。之前没有清除浏览器默认的 html 和 body 标签的 8px margin
+
     // 注意：hooks（use_signal）必须在组件函数体顶层调用，
     // 不能在 use_context_provider 的闭包内调用（违反 Rules of Hooks）
     let state = GlobalState {
@@ -505,8 +674,9 @@ pub fn App() -> Element {
         page: use_signal(|| Page::Records),
         counterparties: use_signal(Vec::new),
         currencies: use_signal(Vec::new),
-        query_from: use_signal(String::new),
-        query_to: use_signal(String::new),
+        // 默认查询范围：近 7 天（起始 = 当前时间往前 7 天，结束 = 当前时间）
+        query_from: use_signal(now_minus_7d_iso),
+        query_to: use_signal(now_local_iso),
         query_cp: use_signal(String::new),
         records: use_signal(Vec::new),
         new_group_name: use_signal(String::new),
@@ -526,9 +696,13 @@ pub fn App() -> Element {
     let st = use_context::<GlobalState>();
     // 显示连接页的情形：尚未连接，或用户主动从主界面切回连接页（保持 connected 不变）
     if (st.show_connect)() || !(st.connected)() {
-        rsx! { ConnectPage {} }
+        rsx! {
+        style { {GLOBAL_CSS} }
+            ConnectPage {}
+        }
     } else {
-        rsx! { MainLayout {} }
+        rsx! { style { {GLOBAL_CSS} }
+        MainLayout {} }
     }
 }
 
@@ -551,7 +725,11 @@ fn MainLayout() -> Element {
     });
 
     let live_ok_flag = (st.live_ok)();
-    let live_text = if live_ok_flag { "● 存活" } else { "○ 离线" };
+    let live_text = if live_ok_flag {
+        "● 存活"
+    } else {
+        "○ 离线"
+    };
     let live_color = if live_ok_flag { "green" } else { "red" };
     let live_at_text = (st.live_at)();
     let api_version_text = (st.api_version)();

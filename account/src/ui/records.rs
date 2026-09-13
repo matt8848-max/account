@@ -6,8 +6,8 @@
 //! 删除整组仅确认组名（不逐一列出组内记录），确认后整组删除。
 
 use super::{
-    ConfirmDialog, DayTimeInput, GlobalState, GroupDraftRow, RecordView, build_iso, cp_label,
-    dt_local, http_post, http_put, parse_money, push_toast,
+    ConfirmDialog, DayTimeInput, GlobalState, GroupDraftRow, RecordView, SearchSelect, build_iso,
+    cp_label, dt_local, http_post, http_put, parse_money, push_toast,
 };
 use crate::models::{Counterparty, Currency, RecordSubmit};
 use dioxus::prelude::*;
@@ -15,12 +15,44 @@ use dioxus::prelude::*;
 #[component]
 pub(crate) fn RecordsPage() -> Element {
     let mut st = use_context::<GlobalState>();
+
+    // 进入本页时主动刷新记录（切页返回后无需手动操作即可看到最新数据）
+    let did_auto_load = use_signal(|| false);
+    use_effect(move || {
+        let mut st = st;
+        let mut did = did_auto_load;
+        if !(did)() {
+            did.set(true);
+            spawn(async move {
+                let from = (st.query_from)();
+                let to = (st.query_to)();
+                let cpid = (st.query_cp)();
+                let b = (st.base)();
+                let body = serde_json::json!({
+                    "from": if from.trim().is_empty() { None } else { Some(build_iso(&from)) },
+                    "to": if to.trim().is_empty() { None } else { Some(build_iso(&to)) },
+                    "counterparty_id": if cpid.is_empty() { None } else { cpid.parse::<i64>().ok() },
+                });
+                match http_put(&b, "/api/records", Some(body)).await {
+                    Ok(v) => st.records.set(serde_json::from_value(v).unwrap_or_default()),
+                    Err(e) => push_toast(&st, &format!("刷新记录失败: {e}")),
+                }
+            });
+        }
+    });
+
     let cp: Vec<Counterparty> = (st.counterparties)().clone();
     let currencies: Vec<Currency> = (st.currencies)().clone();
     let views: Vec<RecordView> = (st.records)().clone();
     let query_from = dt_local(&(st.query_from)());
     let query_to = dt_local(&(st.query_to)());
     let query_cp = (st.query_cp)();
+    // 对象筛选候选（含顶部「全部」项由 empty_label 提供）
+    let filter_candidates: Vec<(i64, String)> = cp
+        .iter()
+        .map(|c| (c.id, cp_label(c, &currencies)))
+        .collect();
+    let query_cp_value: i64 = query_cp.parse().unwrap_or(0);
     let drafts_len = (st.group_drafts)().len();
     let has_records = !views.is_empty();
     let has_cp = !cp.is_empty();
@@ -40,13 +72,14 @@ pub(crate) fn RecordsPage() -> Element {
                     onchange: move |v| st.query_to.set(v),
                 }
                 label { "对象:" }
-                select {
-                    value: query_cp,
-                    onchange: move |e| st.query_cp.set(e.value()),
-                    option { value: "", "全部" }
-                    for c in cp.iter() {
-                        option { value: "{c.id}", "{cp_label(c, &currencies)}" }
-                    }
+                SearchSelect {
+                    candidates: filter_candidates,
+                    value: query_cp_value,
+                    placeholder: String::from("筛选对象"),
+                    empty_label: Some(String::from("全部")),
+                    onchange: move |id: i64| {
+                        st.query_cp.set(if id == 0 { String::new() } else { id.to_string() });
+                    },
                 }
                 button {
                     onclick: move |_| {
@@ -177,37 +210,37 @@ fn GroupRecordRow(idx: usize) -> Element {
     let cp: Vec<Counterparty> = (st.counterparties)().clone();
     let currencies: Vec<Currency> = (st.currencies)().clone();
     let row = (st.group_drafts)().get(idx).cloned().unwrap_or_else(GroupDraftRow::new);
-    let from_id = row.from_id.to_string();
-    let to_id = row.to_id.to_string();
     let currency_id = row.currency_id.to_string();
     let amount = row.amount.clone();
     let remark = row.remark.clone();
     let traded_at = row.traded_at.clone();
 
+    // 候选列表：(交易对象 id, 标签「名称 (货币)」)——供 SearchSelect 搜索选择
+    let candidates: Vec<(i64, String)> = cp
+        .iter()
+        .map(|c| (c.id, cp_label(c, &currencies)))
+        .collect();
+
     rsx! {
         div { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px;border-top:1px dashed #eee;padding-top:6px",
-            select {
-                value: from_id,
-                onchange: move |e| {
+            SearchSelect {
+                candidates: candidates.clone(),
+                value: row.from_id,
+                placeholder: String::from("转出 (从)"),
+                onchange: move |id| {
                     let mut d = st.group_drafts.write();
-                    if idx < d.len() { d[idx].from_id = e.value().parse().unwrap_or(0); }
+                    if idx < d.len() { d[idx].from_id = id; }
                 },
-                option { value: "0", "转出 (从)" }
-                for c in cp.iter() {
-                    option { value: "{c.id}", "{cp_label(c, &currencies)}" }
-                }
             }
             span { "→" }
-            select {
-                value: to_id,
-                onchange: move |e| {
+            SearchSelect {
+                candidates,
+                value: row.to_id,
+                placeholder: String::from("转入 (到)"),
+                onchange: move |id| {
                     let mut d = st.group_drafts.write();
-                    if idx < d.len() { d[idx].to_id = e.value().parse().unwrap_or(0); }
+                    if idx < d.len() { d[idx].to_id = id; }
                 },
-                option { value: "0", "转入 (到)" }
-                for c in cp.iter() {
-                    option { value: "{c.id}", "{cp_label(c, &currencies)}" }
-                }
             }
             input {
                 value: amount,
@@ -273,8 +306,12 @@ fn RecordRow(rec: RecordView) -> Element {
     let amount_currency = format!("{} {}", rec.amount.to_decimal_string(), rec.currency);
     let remark = rec.remark.clone();
     let group_label = rec.group_name.clone().unwrap_or_else(|| format!("组#{gid}"));
+    // 组包含的月份（用于删除组时定位组实例；同 group_id 可跨月复用）
+    let group_months = rec.group_months.clone();
     // 供删除回调闭包捕获的独立副本（move 闭包会消耗捕获得值）
     let delete_traded_at = traded_at.clone();
+    // 供删除组闭包捕获的组月份副本
+    let delete_group_months = group_months.clone();
     // 删除确认弹窗开关
     let mut pending_delete_record = use_signal(|| false);
     let mut pending_delete_group = use_signal(|| false);
@@ -287,11 +324,11 @@ fn RecordRow(rec: RecordView) -> Element {
             if let Some(r) = &remark {
                 span { color: "#888", "({r})" }
             }
-            span { color: "#bbb", "{group_label}" }
             button {
                 onclick: move |_| pending_delete_record.set(true),
                 "🗑 删"
             }
+            span { color: "#bbb", "{group_label}" }
             button {
                 onclick: move |_| pending_delete_group.set(true),
                 "🗑 删组"
@@ -338,20 +375,29 @@ fn RecordRow(rec: RecordView) -> Element {
             ),
             on_confirm: move |_| {
                 let mut st = st;
-                // 闭包需 FnMut：gid 是 Copy 类型，可直接捕获
+                // 闭包需 FnMut：gid 是 Copy 类型可直接捕获；
+                // group_months 为 String，用预副本 clone 供定位组实例
+                let group_months = delete_group_months.clone();
+                // serde_json::json! 会 move 走 group_months，额外保留一份用于前端过滤
+                let group_months_filter = group_months.clone();
                 spawn(async move {
                     let b = (st.base)();
-                    let body = serde_json::json!({ "id": gid });
+                    let body = serde_json::json!({ "id": gid, "group_months": group_months });
                     match http_post(&b, "/api/groups/delete", Some(body)).await {
                         Ok(_) => {
                             // 先刷新交易对象列表（余额已联动变化），
                             // 最后再移除本组记录：此时组件仍挂载，
-                            // 若先 retain 会卸载当前组件导致 spawn 被取消
+                            // 若先 retain 会卸载当前组件导致 spawn 被取消。
+                            // 新方案下同 group_id 可跨月复用，须按「组实例」
+                            // （group_id + group_months）定位，避免误删同号其他组。
                             let b2 = (st.base)();
                             if let Ok(v2) = http_put(&b2, "/api/counterparties", None).await {
                                 st.counterparties.set(serde_json::from_value(v2).unwrap_or_default());
                             }
-                            st.records.write().retain(|r| r.group_id != gid);
+                            st.records.write().retain(|r| {
+                                r.group_id != gid
+                                    || r.group_months.as_deref() != group_months_filter.as_deref()
+                            });
                         }
                         Err(e) => push_toast(&st, &format!("删除组失败: {e}")),
                     }

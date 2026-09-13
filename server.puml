@@ -1,23 +1,12 @@
 @startuml
-start 
 
-:用户在命令行输入server.exe + 一些cli参数;
-:解析命令，如help、ip;
-split
-    :help命令;
-    :执行cli的help命令，不是api的help命令;
-split again
-    :非help，启动服务;
-    
-    if (cli传入的参数有问题) then (yes)
-        :显示错误信息;
-        end
-    endif
-    repeat
-        :执行来自前端通过api发过来的信息;
-    repeat while (前端没有调用close api) is (是的) not (不是)
-    :执行关闭后端;
-end split
+title group_id的获取逻辑
+start
+
+
+:获得要添加的group，所涉及的月份;
+:利用sql语句获取所涉及的月份中，第一个未被使用的正整数x;
+:正整数x作为group_id，group_months保证了不会发生冲突;
 
 end
 
