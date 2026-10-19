@@ -27,9 +27,8 @@
 ```
 记账软件/
 ├── CLAUDE.md
-├── 构思.md              ← 原始需求设计文档
 ├── README.md            ← 用户手册（含运行方式）
-├── 更新日志.md          ← CHANGELOG（0.1.0 → 0.2.1）
+├── 更新日志.md          ← CHANGELOG（0.2.1 → 0.3.0）
 └── account/             # 单包双 bin（server + client 共享代码）
     ├── Cargo.toml
     ├── bin/
@@ -69,6 +68,12 @@
 - **交易记录页进入时自动刷新**：从其他页切回交易记录页时，挂载即主动拉取记录，无需手动操作
 - **默认查询范围近 7 天**：应用启动时交易记录页 `query_from` 默认为当前时间往前 7 天、`query_to` 默认为当前时间（避免默认拉取全部记录）
 - 统计必须选择至少一个交易对象；月份范围用原生 `month` 型输入框
+- **统计页双栏选择**：左侧为可搜索的交易对象列表（「添加」按钮始终可点，重复添加去重，条目不删除），
+  右侧为已选列表（「✕ 踢出」移除）。搜索框为空时显示全部
+- **逐月结算余额由前端计算**：从当前余额出发，按月份从新到旧倒推
+  （某月月末余额 = 当前余额 − 该月之后所有月份的净流入）。因此查询时 `to` 固定传 `null`，
+  拿到起始月之后的全部月份，展示时再按用户选择的结束月过滤
+- **全局 CSS 重置**：根组件 `App` 通过 `style` 元素注入 `GLOBAL_CSS`（连接页与主布局两个分支均注入），清除浏览器默认的 `html, body` 8px `margin`，并统一 `box-sizing: border-box`，避免错误的高度占用导致页面四周空白与多余滚动条
 - 最外层容器用 `height:100dvh; overflow:hidden`，内容区由 `main` 自行滚动，避免桌面/网页出现多余滚动条
 
 ## 数据库设计
@@ -84,6 +89,7 @@ SQLite 单文件数据库，按月分表。核心规则：
 - **升级规则**：只向下兼容一个版本——最新为 `N` 时仅允许从 `N-1` 升级到 `N`；版本 0 与 1 结构相同，均允许升级到 2。更旧的版本拒绝升级。
 - **新建数据库**：直接写入当前版本号（`DB_VERSION=2`），不再是版本 0。
 - **API 版本**：`api::API_VERSION = 1`；`PUT /api/version` 返回 `{ "api": 1, "db": 2 }` 供前端展示。
+- **0.3.0 兼容性**：未修改数据库 schema，`DB_VERSION` 保持 2、`API_VERSION` 保持 1；0.2.x 的数据库与旧客户端均可直接使用。
 
 ### 总表（meta，如 `total_stats`）
 
@@ -127,6 +133,11 @@ SQLite 单文件数据库，按月分表。核心规则：
 - `(1000, 100)` → 10.00
 
 避免浮点数精度误差。不同货币分别统计，不做汇率换算合并。
+
+**计算后自动去零**：`Money` 提供 `normalized()`（约去 value/divisor 的公共 10 因子）、
+`checked_add()` / `checked_sub()`（按最小公倍数对齐精度，结果自动去零）。余额联动、月度统计、对象统计、
+统计页结算余额汇总等所有计算结果必须使用这些方法（如 `1.3 + 2.7` 得到 `(4,1)` 而不是 `(40,10)`）。
+**数据库存储不强制去零**：`adjust_counterparty_balance` 写回时仍沿用原最大 divisor，保持历史数据精度。
 
 ### 货币表（currencies）
 
@@ -200,7 +211,7 @@ SQLite 单文件数据库，按月分表。核心规则：
 | PUT | `/api/version` | 返回 API 与数据库版本号 `{ "api": 1, "db": 2 }` |
 | PUT | `/api/stats` | 查总表的收支统计 |
 | PUT | `/api/stats/month` | 查某月范围的收支统计（from/to 为 `YYYY-MM`，可省略） |
-| PUT | `/api/stats/objects` | 按指定一个/多个交易对象统计月范围收支；响应含 `balance` 条目（当前余额） |
+| PUT | `/api/stats/objects` | 按指定一个/多个交易对象统计月范围收支；响应含 `balance` 条目（当前余额）。统计页查询时 `to` 传 `null`，由前端按返回的全部月份倒推每月结算余额 |
 | PUT | `/api/records` | 查一定时间范围的所有记录（含 `group_months`） |
 | PUT | `/api/records/object` | 查一定时间范围内指定交易对象的所有记录 |
 | PUT | `/api/counterparties` | 查有哪些交易对象 |
@@ -224,11 +235,11 @@ SQLite 单文件数据库，按月分表。核心规则：
 
 跨页公用的代码保留在 `ui.rs`（父模块）；**每页 UI 分别存于 `ui/` 子目录**（类似 `db.rs` + `db/month.rs`）：
 
-- `ui.rs`：全局状态（`GlobalState`）、HTTP 封装（`http_put/http_post`）、平台差异封装（sleep/now_str/提示）、`DayTimeInput`、`SearchSelect`（搜索+候选选择组件，支持 `↑`/`↓` 移动高亮、`Enter` 确认、`empty_label` 插入「全部」项）、`ConfirmDialog`、`MainLayout`、根 `App`
+- `ui.rs`：全局状态（`GlobalState`）、HTTP 封装（`http_put/http_post`）、平台差异封装（sleep/now_str/提示）、全局 CSS 重置（`GLOBAL_CSS`，`App` 注入 `style` 元素；清除浏览器默认的 `html/body` 8px `margin` 并统一 `box-sizing: border-box`）、`DayTimeInput`、`SearchSelect`（搜索+候选选择组件，支持 `↑`/`↓` 移动高亮、`Enter` 确认、`empty_label` 插入「全部」项）、`ConfirmDialog`、`MainLayout`、根 `App`
 - `ui/connect.rs`：连接页（含关闭服务器按钮）
 - `ui/records.rs`：交易记录浏览器（挂载时自动刷新；行格式：时间 转出→转入 金额 货币 备注 删除条目按钮 组名 删除组按钮；新建组行的转出/转入、顶部「对象」筛选均用 `SearchSelect` 搜索选择）
-- `ui/master.rs`：交易对象/货币管理
-- `ui/stats.rs`：数据统计
+- `ui/master.rs`：交易对象/货币管理（货币、交易对象均有搜索栏，空搜索显示全部；灰白相间列表——交易对象为「名称左 / 金额右 / 货币类型右」，货币名称居中）
+- `ui/stats.rs`：数据统计（双栏交易对象选择：左可搜索列表点「添加」自动去重、右已选列表可「踢出」；结果卡片显示当前余额与逐月收入/支出/前端计算的结算余额）
 
 **平台差异条件编译**（`#[cfg(target_arch = "wasm32")]`）：
 - HTTP：wasm 用 gloo-net、native 用 reqwest（跳过自签名证书验证）
@@ -261,7 +272,7 @@ cargo run --bin server -- --ip 127.0.0.1        # 指定监听 IP
 cargo run --bin server -- --db data/custom.db   # 指定数据库路径
 cargo run --bin server -- --help                # 查看帮助
 
-cargo test                          # 运行单元测试（30+）
+cargo test                          # 运行单元测试（40+）
 
 # 打开调试日志（PowerShell：$env:RUST_LOG="debug"; cargo run --bin server）
 $env:RUST_LOG="debug"; cargo run --bin server

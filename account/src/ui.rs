@@ -70,9 +70,21 @@ pub(crate) struct ObjectStatItem {
 pub(crate) struct ObjectGroupView {
     pub name: String,
     pub currency: String,
+    /// 当前余额
     pub balance: Money,
-    /// (月份, 收入, 支出)
-    pub monthly: Vec<(String, Option<Money>, Option<Money>)>,
+    /// 按月份升序的收支与月末结算余额
+    pub monthly: Vec<MonthStatView>,
+}
+
+/// 统计页单月明细（月份 + 收支 + 该月月末结算余额）
+pub(crate) struct MonthStatView {
+    pub month: String,
+    /// 该月收入（无记录为 None）
+    pub income: Option<Money>,
+    /// 该月支出（无记录为 None）
+    pub expense: Option<Money>,
+    /// 该月月末的结算余额（前端由当前余额向前倒推计算）
+    pub settlement: Money,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -656,10 +668,14 @@ pub(crate) fn ConfirmDialog(
 
 #[component]
 pub fn App() -> Element {
+    // 全局 CSS 重置（人工排查修复的 UI bug）：
+    // 浏览器默认给 html/body 加 8px margin，叠加 height:100% 后造成错误的高度占用，
+    // 表现为页面四周空白 + 多余滚动条，故在根组件统一清除默认边距并改用 border-box 盒模型。
+    // 连接页与主布局是两个互斥返回的 rsx 分支，需各自注入一次，否则漏掉的分支仍会残留默认边距。
     const GLOBAL_CSS: &str = "
         html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
         *, *::before, *::after { box-sizing: border-box; }
-    ";// 人工修复了一个UIbug,用于修复错误的高度占用所导致的UI bug。之前没有清除浏览器默认的 html 和 body 标签的 8px margin
+    ";
 
     // 注意：hooks（use_signal）必须在组件函数体顶层调用，
     // 不能在 use_context_provider 的闭包内调用（违反 Rules of Hooks）

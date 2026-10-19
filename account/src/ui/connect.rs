@@ -50,7 +50,10 @@ pub(crate) fn ConnectPage() -> Element {
                                 Ok(v) => {
                                     let api = v["api"].as_i64().unwrap_or(0);
                                     let dbv = v["db"].as_i64().unwrap_or(0);
-                                    st.api_version.set(format!("API={api} DB={dbv}"));
+                                    st.api_version.set(format!(
+                                        "v{} API={api} DB={dbv}",
+                                        env!("CARGO_PKG_VERSION")
+                                    ));
                                 }
                                 Err(e) => { st.status_msg.set(format!("拉取版本失败: {e}")); return; }
                             }

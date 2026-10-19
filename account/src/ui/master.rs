@@ -15,6 +15,37 @@ pub(crate) fn MasterPage() -> Element {
     let counterparties: Vec<Counterparty> = (st.counterparties)().clone();
     let has_cur = !currencies.is_empty();
     let has_cp = !counterparties.is_empty();
+    // 搜索词（空 → 显示全部，符合「没有内容时全显示」的要求）
+    let mut cur_search = use_signal(String::new);
+    let mut cp_search = use_signal(String::new);
+
+    // 货币列表过滤：按名称子串匹配，忽略大小写
+    let cq = (cur_search)().trim().to_lowercase();
+    let filtered_currencies: Vec<Currency> = currencies
+        .iter()
+        .filter(|c| cq.is_empty() || c.name.to_lowercase().contains(&cq))
+        .cloned()
+        .collect();
+
+    // 交易对象列表过滤：名称或货币类型子串匹配，忽略大小写
+    let cur_names: std::collections::HashMap<i64, String> =
+        currencies.iter().map(|c| (c.id, c.name.clone())).collect();
+    let pq = (cp_search)().trim().to_lowercase();
+    let filtered_counterparties: Vec<Counterparty> = counterparties
+        .iter()
+        .filter(|c| {
+            if pq.is_empty() {
+                return true;
+            }
+            if c.name.to_lowercase().contains(&pq) {
+                return true;
+            }
+            cur_names
+                .get(&c.currency_id)
+                .is_some_and(|n| n.to_lowercase().contains(&pq))
+        })
+        .cloned()
+        .collect();
 
     rsx! {
         div { style: "display:flex;flex-direction:column;gap:16px",
@@ -116,32 +147,67 @@ pub(crate) fn MasterPage() -> Element {
                 }
             }
 
-            h4 { "货币列表" }
-            div { style: "display:flex;gap:8px;flex-wrap:wrap",
-                for c in currencies {
-                    CurrencyRow { c: c }
+            // 货币列表：搜索 + 灰白相间列表（名称居中）
+            div { style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap",
+                h4 { style: "margin:0", "货币列表" }
+                input {
+                    style: "width:220px",
+                    value: cur_search,
+                    placeholder: "搜索货币...",
+                    oninput: move |e| cur_search.set(e.value()),
                 }
-                if !has_cur {
-                    p { color: "#999", "暂无货币" }
+                span { style: "font-size:12px;color:#888", "{filtered_currencies.len()} / {currencies.len()}" }
+            }
+            div { style: "border:1px solid #ddd;border-radius:4px;overflow:hidden",
+                div { style: "display:grid;grid-template-columns:minmax(0,1fr) 48px;align-items:center;padding:4px 10px;background:#eef0f3;color:#666;font-size:12px",
+                    span { style: "text-align:center", "货币" }
+                    span { "" }
+                }
+                for (idx, c) in filtered_currencies.iter().cloned().enumerate() {
+                    CurrencyRow { c: c, striped: idx % 2 == 1 }
+                }
+                if filtered_currencies.is_empty() {
+                    div { style: "padding:8px 10px;color:#999",
+                        if has_cur { "无匹配货币" } else { "暂无货币" }
+                    }
                 }
             }
 
-            h4 { "交易对象列表" }
-            div { style: "display:flex;gap:8px;flex-wrap:wrap",
-                for c in counterparties {
-                    CounterpartyRow { c: c }
+            // 交易对象列表：搜索 + 灰白相间三列（名称左 / 金额右 / 货币类型右）
+            div { style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap",
+                h4 { style: "margin:0", "交易对象列表" }
+                input {
+                    style: "width:240px",
+                    value: cp_search,
+                    placeholder: "搜索名称或货币类型...",
+                    oninput: move |e| cp_search.set(e.value()),
                 }
-                if !has_cp {
-                    p { color: "#999", "暂无交易对象" }
+                span { style: "font-size:12px;color:#888", "{filtered_counterparties.len()} / {counterparties.len()}" }
+            }
+            div { style: "border:1px solid #ddd;border-radius:4px;overflow:hidden",
+                div { style: "display:grid;grid-template-columns:minmax(0,1fr) 120px 100px 48px;gap:8px;align-items:center;padding:4px 10px;background:#eef0f3;color:#666;font-size:12px",
+                    span { "名称" }
+                    span { style: "text-align:right", "金额" }
+                    span { style: "text-align:right", "货币类型" }
+                    span { "" }
+                }
+                for (idx, c) in filtered_counterparties.iter().cloned().enumerate() {
+                    CounterpartyRow { c: c, striped: idx % 2 == 1 }
+                }
+                if filtered_counterparties.is_empty() {
+                    div { style: "padding:8px 10px;color:#999",
+                        if has_cp { "无匹配交易对象" } else { "暂无交易对象" }
+                    }
                 }
             }
+
         }
     }
 }
 
-/// 单条货币行
+/// 单条货币行（灰白相间；名称居中）
 #[component]
-fn CurrencyRow(c: Currency) -> Element {
+fn CurrencyRow(c: Currency, striped: bool) -> Element {
     let st = use_context::<GlobalState>();
     let cid = c.id;
     let cname = c.name.clone();
@@ -149,8 +215,12 @@ fn CurrencyRow(c: Currency) -> Element {
     let mut pending_delete = use_signal(|| false);
 
     rsx! {
-        div { style: "border:1px solid #ddd;padding:4px 8px;border-radius:4px;display:flex;gap:8px;align-items:center",
-            span { "{cname}" }
+        div {
+            style: format!(
+                "display:grid;grid-template-columns:minmax(0,1fr) 48px;align-items:center;gap:8px;padding:5px 10px;border-bottom:1px solid #eee;background:{}",
+                if striped { "#f5f6f8" } else { "#fff" }
+            ),
+            span { style: "text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap", "{cname}" }
             button {
                 onclick: move |_| pending_delete.set(true),
                 "✕"
@@ -176,9 +246,9 @@ fn CurrencyRow(c: Currency) -> Element {
     }
 }
 
-/// 单条交易对象行
+/// 单条交易对象行（灰白相间；名称左 / 金额右 / 货币类型右）
 #[component]
-fn CounterpartyRow(c: Counterparty) -> Element {
+fn CounterpartyRow(c: Counterparty, striped: bool) -> Element {
     let st = use_context::<GlobalState>();
     let cid = c.id;
     let cname = c.name.clone();
@@ -192,9 +262,14 @@ fn CounterpartyRow(c: Counterparty) -> Element {
     let mut pending_delete = use_signal(|| false);
 
     rsx! {
-        div { style: "border:1px solid #ddd;padding:4px 8px;border-radius:4px;display:flex;gap:8px;align-items:center",
-            span { "{cname}" }
-            span { style: "font-size:12px;color:#888", "余额 {bal} {cur_name}" }
+        div {
+            style: format!(
+                "display:grid;grid-template-columns:minmax(0,1fr) 120px 100px 48px;gap:8px;align-items:center;padding:5px 10px;border-bottom:1px solid #eee;background:{}",
+                if striped { "#f5f6f8" } else { "#fff" }
+            ),
+            span { style: "text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap", "{cname}" }
+            span { style: "text-align:right;font-variant-numeric:tabular-nums", "{bal}" }
+            span { style: "text-align:right;color:#666;overflow:hidden;text-overflow:ellipsis;white-space:nowrap", "{cur_name}" }
             button {
                 onclick: move |_| pending_delete.set(true),
                 "✕"

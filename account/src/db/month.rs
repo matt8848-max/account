@@ -582,16 +582,10 @@ pub fn compute_object_stats(conn: &Connection, query: &ObjectStatsQuery) -> Resu
             for (dir, cur, m) in items {
                 let map = if dir == "income" { &mut income_map } else { &mut expense_map };
                 if let Some(existing) = map.get_mut(&cur) {
-                    // 按最大 divisor 对齐累加
-                    let divisor = existing.divisor.max(m.divisor);
-                    let scale = |v: i64, from: u32, to: u32| -> i64 {
-                        if from == to { v } else { v * (to / from) as i64 }
-                    };
-                    let new_value = scale(existing.value, existing.divisor, divisor)
-                        + scale(m.value, m.divisor, divisor);
-                    *existing = Money { value: new_value, divisor };
+                    // 定点数累加：自动对齐精度，并在计算结果中去零
+                    *existing = existing.checked_add(m).map_err(|e| anyhow::anyhow!(e))?;
                 } else {
-                    map.insert(cur.clone(), m);
+                    map.insert(cur.clone(), m.normalized());
                 }
             }
             let name = cp_names.get(&obj_id).map(|(n, _)| n.clone()).unwrap_or_else(|| format!("#{obj_id}"));
@@ -655,9 +649,9 @@ pub fn compute_month_stats(conn: &Connection, month: &str) -> Result<MonthStats>
     for row in rows {
         let (income_currency, expense_currency, money) = row?;
         // 转入方的货币为收入
-        upsert_sum(&mut income_map, income_currency, money);
+        upsert_sum(&mut income_map, income_currency, money)?;
         // 转出方的货币为支出
-        upsert_sum(&mut expense_map, expense_currency, money);
+        upsert_sum(&mut expense_map, expense_currency, money)?;
     }
 
     Ok(MonthStats {
@@ -673,23 +667,22 @@ pub fn compute_month_stats(conn: &Connection, month: &str) -> Result<MonthStats>
     })
 }
 
-/// 定点数累加，按最大 divisor 对齐
-fn upsert_sum(map: &mut Vec<(String, i64, u32)>, name: String, money: Money) {
+/// 定点数累加：自动对齐精度，并在计算结果中去零
+fn upsert_sum(map: &mut Vec<(String, i64, u32)>, name: String, money: Money) -> Result<()> {
     if let Some(entry) = map.iter_mut().find(|(n, _, _)| *n == name) {
-        let divisor = entry.2.max(money.divisor);
-        let scale = |value: i64, from: u32, to: u32| -> i64 {
-            if from == to {
-                value
-            } else {
-                value * (to / from) as i64
-            }
+        let current = Money {
+            value: entry.1,
+            divisor: entry.2,
         };
+        let sum = current.checked_add(money).map_err(|e| anyhow::anyhow!(e))?;
         entry.0.clone_from(&name);
-        entry.1 = scale(entry.1, entry.2, divisor) + scale(money.value, money.divisor, divisor);
-        entry.2 = divisor;
+        entry.1 = sum.value;
+        entry.2 = sum.divisor;
     } else {
+        let money = money.normalized();
         map.push((name, money.value, money.divisor));
     }
+    Ok(())
 }
 
 /// 列出所有已存在的月表名
@@ -972,8 +965,48 @@ mod tests {
                 .map(|(_, _, _, m)| m.value)
                 .unwrap()
         };
-        assert_eq!(find(&format!("income:RMB")), 100);
-        assert_eq!(find(&format!("expense:RMB")), 100);
+        assert_eq!(find("income:RMB"), 100);
+        assert_eq!(find("expense:RMB"), 100);
+    }
+
+    /// 验证计算后自动去零：同一月 1.3 + 2.7 = 4.0，
+    /// 月度统计与对象统计的结果都应是 (4,1) 而不是 (40,10)
+    #[test]
+    fn stats_sums_are_normalized_after_calculation() {
+        let mut conn = setup();
+        let recs = vec![rec(1, 2, Money { value: 13, divisor: 10 }, "2026-08-02T08:00:00")];
+        add_group(&mut conn, "小数一", &recs).unwrap();
+        let recs = vec![rec(1, 2, Money { value: 27, divisor: 10 }, "2026-08-03T08:00:00")];
+        add_group(&mut conn, "小数二", &recs).unwrap();
+
+        // 月度统计（按货币汇总）自动去零
+        let stats = compute_month_stats(&conn, "2026-08").unwrap();
+        assert_eq!(stats.income[0].1, Money::from_int(4));
+        assert_eq!(stats.expense[0].1, Money::from_int(4));
+
+        // 对象统计（按对象 + 货币汇总）自动去零
+        let obj = compute_object_stats(
+            &conn,
+            &ObjectStatsQuery {
+                counterparty_ids: vec![1, 2],
+                from: None,
+                to: None,
+            },
+        )
+        .unwrap();
+        let rows = &obj[0].1;
+        let income = rows
+            .iter()
+            .find(|(_, _, t, _)| t == "income:RMB")
+            .map(|(_, _, _, m)| *m)
+            .unwrap();
+        let expense = rows
+            .iter()
+            .find(|(_, _, t, _)| t == "expense:RMB")
+            .map(|(_, _, _, m)| *m)
+            .unwrap();
+        assert_eq!(income, Money::from_int(4));
+        assert_eq!(expense, Money::from_int(4));
     }
 
     // ---------- 余额自动联动测试 ----------

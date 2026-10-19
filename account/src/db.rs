@@ -6,7 +6,7 @@
 //! - `currencies` — 货币表
 //! - `counterparties` — 交易对象表
 
-use crate::models::{MonthMeta, MonthStats};
+use crate::models::{MonthMeta, MonthStats, Money};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::Path;
@@ -337,21 +337,35 @@ pub fn adjust_counterparty_balance(
     delta_value: i64,
     delta_divisor: u32,
 ) -> Result<()> {
-    // 读取当前余额，按最大 divisor 对齐后相加，再写回
+    // 读取当前余额，先按定点数运算规则对齐精度并**去零**（计算后自动去零），
+    // 再按原有最大 divisor 写回——存储不强制去零，保持历史数据精度行为。
     let (cur_value, cur_divisor): (i64, u32) = conn.query_row(
         "SELECT balance_value, balance_divisor FROM counterparties WHERE id = ?1",
         [id],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    let divisor = cur_divisor.max(delta_divisor);
-    let scale = |v: i64, from: u32, to: u32| -> i64 {
-        if from == to { v } else { v * (to / from) as i64 }
+    let current = Money {
+        value: cur_value,
+        divisor: cur_divisor,
     };
-    let new_value =
-        scale(cur_value, cur_divisor, divisor) + scale(delta_value, delta_divisor, divisor);
+    let delta = Money {
+        value: delta_value,
+        divisor: delta_divisor,
+    };
+    let computed = current.checked_add(delta).map_err(|e| anyhow::anyhow!(e))?;
+    let divisor = cur_divisor.max(delta_divisor);
+    let (new_value, new_divisor) = if divisor % computed.divisor == 0 {
+        let scale = (divisor / computed.divisor) as i64;
+        match computed.value.checked_mul(scale) {
+            Some(v) => (v, divisor),
+            None => return Err(anyhow::anyhow!("余额计算溢出")),
+        }
+    } else {
+        (computed.value, computed.divisor)
+    };
     conn.execute(
         "UPDATE counterparties SET balance_value = ?2, balance_divisor = ?3 WHERE id = ?1",
-        rusqlite::params![id, new_value, divisor],
+        rusqlite::params![id, new_value, new_divisor],
     )?;
     Ok(())
 }
