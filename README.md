@@ -14,9 +14,11 @@
 |---|---|---|
 | Windows 10/11（x64） | ✅ 桌面应用（使用系统自带 WebView2） | ✅ |
 | Linux（x64） | ✅ 桌面应用（使用系统自带 WebKitGTK） | ✅ |
-| macOS（Apple Silicon / Intel） | ✅ 桌面应用（使用系统自带 WKWebView） | ✅ |
+| macOS（Apple Silicon / arm64） | ✅ 桌面应用（使用系统自带 WKWebView） | ✅ |
 | 浏览器（现代浏览器） | ✅ Web 版（wasm） | — |
 | Android / iOS | ❌ **不支持手机端** | ❌ |
+
+> macOS **Intel（x86_64）版本已不再提供**（该类设备已基本淘汰），仅发布 Apple Silicon 版。
 
 > 桌面客户端**不自带浏览器内核**（安装包最小化）：Windows 用系统 WebView2、Linux 用 WebKitGTK、macOS 用 WKWebView。
 > 若系统缺少对应 WebView 运行时，请先安装（Windows 10/11 一般已自带 WebView2）。
@@ -73,6 +75,14 @@
 
 环境要求：`cargo/rustc 1.88+`（edition 2024）、`dioxus-cli 0.7.10`、`wasm32-unknown-unknown` 目标（仅 Web 版需要）。
 
+**Linux 额外系统依赖**（server 与 client 共用同一个 lib，含 UI 模块，因此编译 server 也需要）：
+
+```bash
+sudo apt-get install -y pkg-config libglib2.0-dev libgtk-3-dev \
+  libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
+  libayatana-appindicator3-dev librsvg2-dev patchelf
+```
+
 ```bash
 cd account
 
@@ -113,7 +123,7 @@ dx bundle --release --platform desktop --bin client --features bundle
 
 - 推送到 `main` 分支会触发 `.github/workflows/release.yml`
 - 版本号取自 `account/Cargo.toml`，工作流**自动以其作为 tag 创建 Release**（tag 已存在则只构建不发版）
-- 发布产物：计算端（Windows / Linux / macOS）、桌面客户端（Windows / Linux / macOS，macOS 含 Apple Silicon 与 Intel）、Web 版静态站点
+- 发布产物：计算端（Windows / Linux / macOS arm64）、桌面客户端（Windows / Linux / macOS arm64）、Web 版静态站点
 
 ## 开发与测试
 
