@@ -27,15 +27,19 @@
 ```
 记账软件/
 ├── CLAUDE.md
-├── README.md            ← 用户手册（含运行方式）
-├── 更新日志.md          ← CHANGELOG（0.2.1 → 0.3.0）
+├── README.md            ← 软件说明（功能、支持平台、安装与使用）
+├── 更新日志.md          ← CHANGELOG（0.3.0 → 0.4.0）
+├── LICENSE              ← MIT
+├── .github/workflows/
+│   └── release.yml      ← push main 自动构建 + 以 Cargo 版本为 tag 创建 Release
 └── account/             # 单包双 bin（server + client 共享代码）
     ├── Cargo.toml
     ├── bin/
     │   ├── server.rs    # 计算端（native）— CLI 参数 + TLS + HTTP/2 + API 路由 + 优雅关闭
     │   └── client.rs    # 客户端启动器（native 桌面 / wasm Web）
     └── src/
-        ├── lib.rs       ← 统一模块导出（models/api/db/ui）
+        ├── lib.rs       ← 统一模块导出（export/models/api/db/ui）
+        ├── export.rs    ← xlsx 导出（纯逻辑：月份边界、汇总、sheet 名清洗、工作簿生成）
         ├── models.rs    ← 数据模型（金额定点数、组、记录、货币、交易对象）
         ├── api.rs       ← HTTP API 实现（PUT=读，POST=其余所有 + close + CORS）
         ├── db.rs        ← 数据库连接、迁移（DB_VERSION=2）、总表/货币/对象操作
@@ -45,12 +49,14 @@
             ├── connect.rs  ← 连接页（含「关闭服务器」按钮）
             ├── records.rs  ← 交易记录浏览器（删除记录/组有确认弹窗；进入页面自动刷新）
             ├── master.rs   ← 交易对象/货币管理（删除有确认弹窗）
-            └── stats.rs    ← 数据统计
+            ├── stats.rs    ← 数据统计（含「📤 导出交易记录」入口）
+            ├── export.rs   ← 导出保存对话框（Web 浏览器下载 / 桌面 rfd 另存为）
+            └── update.rs   ← 启动时检测 GitHub 新版本（仅一次）
 ```
 
 **依赖 target 分离**：
-- `[target.'cfg(not(target_arch = "wasm32"))']` — axum/axum-server/rusqlite(bundled)/tokio/reqwest/dioxus(desktop)/rcgen
-- `[target.wasm32-unknown-unknown]` — dioxus(web)/gloo-net/gloo-timers/web-sys
+- `[target.'cfg(not(target_arch = "wasm32"))']` — axum/axum-server/rusqlite(bundled)/tokio/reqwest/dioxus(desktop)/rcgen/rfd/rust_xlsxwriter
+- `[target.wasm32-unknown-unknown]` — dioxus(web)/gloo-net/gloo-timers/web-sys/wasm-bindgen/rust_xlsxwriter(wasm feature)
 
 ## 架构与数据流
 
@@ -75,6 +81,14 @@
   拿到起始月之后的全部月份，展示时再按用户选择的结束月过滤
 - **全局 CSS 重置**：根组件 `App` 通过 `style` 元素注入 `GLOBAL_CSS`（连接页与主布局两个分支均注入），清除浏览器默认的 `html, body` 8px `margin`，并统一 `box-sizing: border-box`，避免错误的高度占用导致页面四周空白与多余滚动条
 - 最外层容器用 `height:100dvh; overflow:hidden`，内容区由 `main` 自行滚动，避免桌面/网页出现多余滚动条
+- **导出 xlsx（数据统计页）**：点「📤 导出交易记录」→ `ConfirmDialog` 展示范围（对象 + 月份区间）→
+  确认后按对象逐个 `PUT /api/records`（`from`=起始月 1 号 0 点、`to`=结束月最后一天 23:59:59、`counterparty_id`）→
+  `export::build_xlsx` 生成字节 → 保存对话框（Web 走 `Blob`+`<a download>`；桌面走 `rfd` 另存为 + `std::fs::write`）
+- **导出格式**：每对象一个 sheet；第 1 行交易对象/时间区间/流水总额（转入、转出、净额）；第 2 行表头（`autofilter` 默认开启、冻结前两行）；
+  第 3 行起明细按 `traded_at` 升序；「金额」列为公式 `=H{r}/I{r}`（原始金额分子/分母）并写入缓存值
+- **启动更新检测**：根组件 `App` 挂载时（`use_effect`，仅一次）请求
+  `https://api.github.com/repos/{owner}/{repo}/releases/latest`，`owner/repo` 由 `env!("CARGO_PKG_REPOSITORY")` 解析；
+  版本比较为逐段数字比较（`ui/update.rs::is_newer`），失败/无 release 静默跳过
 
 ## 数据库设计
 
@@ -227,7 +241,7 @@ SQLite 单文件数据库，按月分表。核心规则：
 | `--db <路径>` | 数据库文件路径 | 与 server 可执行文件同目录下的 `account.db` |
 | `-h, --help` | 显示帮助 | — |
 
-启动成功后输出 info 日志：监听地址（`https://IP:3000`）、API 版本、数据库版本、当前时间（UTC+8）。
+启动成功后输出 info 日志：监听地址（`https://IP:3000`）、API 版本、数据库版本、当前时间（**系统时区**，形如 `UTC+8 2026-10-31 12:34:56`；负偏移 `UTC-8`、半小时时区 `UTC+5:30`）。
 
 日志级别：debug 构建默认 `debug`，release 构建默认 `info`（仍可被 `RUST_LOG` 覆盖）。
 
@@ -235,11 +249,13 @@ SQLite 单文件数据库，按月分表。核心规则：
 
 跨页公用的代码保留在 `ui.rs`（父模块）；**每页 UI 分别存于 `ui/` 子目录**（类似 `db.rs` + `db/month.rs`）：
 
-- `ui.rs`：全局状态（`GlobalState`）、HTTP 封装（`http_put/http_post`）、平台差异封装（sleep/now_str/提示）、全局 CSS 重置（`GLOBAL_CSS`，`App` 注入 `style` 元素；清除浏览器默认的 `html/body` 8px `margin` 并统一 `box-sizing: border-box`）、`DayTimeInput`、`SearchSelect`（搜索+候选选择组件，支持 `↑`/`↓` 移动高亮、`Enter` 确认、`empty_label` 插入「全部」项）、`ConfirmDialog`、`MainLayout`、根 `App`
+- `ui.rs`：全局状态（`GlobalState`）、HTTP 封装（`http_put/http_post` 及绝对 URL 的 `http_get`）、平台差异封装（sleep/now_str/提示）、全局 CSS 重置（`GLOBAL_CSS`，`App` 注入 `style` 元素；清除浏览器默认的 `html/body` 8px `margin` 并统一 `box-sizing: border-box`）、`DayTimeInput`、`SearchSelect`（搜索+候选选择组件：输入框 `value` 只绑定用户输入、已选项用 `placeholder` 呈现；`Enter` 确认、`Escape`/失焦收起候选、候选用 `mousedown`+`prevent_default` 选择、`empty_label` 插入「全部」项）、`ConfirmDialog`、`MainLayout`、根 `App`
 - `ui/connect.rs`：连接页（含关闭服务器按钮）
 - `ui/records.rs`：交易记录浏览器（挂载时自动刷新；行格式：时间 转出→转入 金额 货币 备注 删除条目按钮 组名 删除组按钮；新建组行的转出/转入、顶部「对象」筛选均用 `SearchSelect` 搜索选择）
 - `ui/master.rs`：交易对象/货币管理（货币、交易对象均有搜索栏，空搜索显示全部；灰白相间列表——交易对象为「名称左 / 金额右 / 货币类型右」，货币名称居中）
-- `ui/stats.rs`：数据统计（双栏交易对象选择：左可搜索列表点「添加」自动去重、右已选列表可「踢出」；结果卡片显示当前余额与逐月收入/支出/前端计算的结算余额）
+- `ui/stats.rs`：数据统计（双栏交易对象选择：左可搜索列表点「添加」自动去重、右已选列表可「踢出」；结果卡片显示当前余额与逐月收入/支出/前端计算的结算余额；顶部提供「📤 导出交易记录」）
+- `ui/export.rs`：导出保存对话框（`ExportSaveDialog` + `PendingExport`；`sheet_from_views` 把记录视图转成导出表；Web 用 `Blob`+`<a download>` 下载，桌面用 `rfd::FileDialog` 选目录并 `std::fs::write`）
+- `ui/update.rs`：启动时更新检测（`spawn_check`/`repo_slug`/`parse_release`/`is_newer`）
 
 **平台差异条件编译**（`#[cfg(target_arch = "wasm32")]`）：
 - HTTP：wasm 用 gloo-net、native 用 reqwest（跳过自签名证书验证）
@@ -272,19 +288,34 @@ cargo run --bin server -- --ip 127.0.0.1        # 指定监听 IP
 cargo run --bin server -- --db data/custom.db   # 指定数据库路径
 cargo run --bin server -- --help                # 查看帮助
 
-cargo test                          # 运行单元测试（40+）
+cargo test                          # 运行单元测试（69 个，含导出/更新检测/时区）
+cargo clippy --all-targets           # 静态检查
 
 # 打开调试日志（PowerShell：$env:RUST_LOG="debug"; cargo run --bin server）
 $env:RUST_LOG="debug"; cargo run --bin server
 
 # 前端
+cargo check --target wasm32-unknown-unknown --bin client   # wasm 类型检查
 cargo build --target wasm32-unknown-unknown --bin client   # Web 构建
-dx build --release --platform web --bin client             # Dioxus 打包（必须指明 bin=client）
+dx build --release --platform web --bin client --features bundle   # Dioxus 打包（必须指明 bin=client）
 cargo run --bin client             # 桌面客户端（native）
+dx bundle --release --platform desktop --bin client --features bundle  # 桌面安装包
 
 # 安装 dioxus-cli（指定版本）
-cargo install dioxus-cli --version 0.7.9
+cargo install dioxus-cli --version 0.7.10
 ```
+
+## 发布流程（CI）
+
+- 推送 `main` 分支 → `.github/workflows/release.yml` 自动构建：
+  计算端（Windows/Linux/macOS，含 macOS x64/arm64）、桌面客户端（同上，最小化包：`Dioxus.toml` 的
+  `webview_install_mode = "Skip"` 表示不自带 WebView2）、Web 版（wasm）
+- `meta` 作业从 `account/Cargo.toml` 读取 `version` 作为 **tag（不带 v 前缀）**；
+  用 `git ls-remote --tags` 判断 tag 是否已存在，已存在则只构建不发版（幂等）
+- 发版由 `softprops/action-gh-release` 完成（需要 `permissions: contents: write`）
+- 客户端「启动更新检测」读取 `releases/latest`，因此**首个 release 发布后该功能才会给出提示**
+- **`Cargo.toml` 的 `description` 必须为 ASCII**：`dx bundle` 生成的 NSIS / WiX 脚本使用 code page 1252，
+  中文会导致 `makensis`（Bad text encoding）与 `light.exe`（LGHT0311）失败；中文说明写在 README 中
 
 ## 代码规范
 

@@ -1,229 +1,144 @@
 # 记账软件
 
-个人账单管理系统。客户端-服务器（C/S）架构：
+个人记账软件：记录每一笔转入/转出，按月份查看收支与结算余额，并可将指定交易对象、指定月份区间的流水导出为 Excel。
 
-- **计算端（server）**：Rust + axum（HTTP/2.0 TLS），SQLite 按月分表存储
-- **客户端（client）**：Dioxus 0.7（同一份 UI 组件，支持 Web / 桌面）
+- **单用户、无账号体系**：数据只保存在自己电脑上的 SQLite 文件里
+- **客户端-服务器（C/S）架构**：计算端（server）负责存储与统计，客户端（client）负责展示
+- **同一份界面代码**同时编译为桌面程序与网页（WebAssembly）
 
-后端地址：`https://127.0.0.2:3000`（自签证书），当前版本 **0.3.0**。
+当前版本 **0.4.0**，开源协议 **MIT**。
 
-## 环境要求
+## 支持平台
 
-| 工具 | 版本 |
-|---|---|
-| cargo / rustc | 1.96+（edition 2024） |
-| dioxus-cli | 0.7.9（`cargo install dioxus-cli --version 0.7.9`） |
-| wasm32 target | `rustup target add wasm32-unknown-unknown` |
+| 平台 | 客户端 | 计算端（server） |
+|---|---|---|
+| Windows 10/11（x64） | ✅ 桌面应用（使用系统自带 WebView2） | ✅ |
+| Linux（x64） | ✅ 桌面应用（使用系统自带 WebKitGTK） | ✅ |
+| macOS（Apple Silicon / Intel） | ✅ 桌面应用（使用系统自带 WKWebView） | ✅ |
+| 浏览器（现代浏览器） | ✅ Web 版（wasm） | — |
+| Android / iOS | ❌ **不支持手机端** | ❌ |
 
-## 编译
+> 桌面客户端**不自带浏览器内核**（安装包最小化）：Windows 用系统 WebView2、Linux 用 WebKitGTK、macOS 用 WKWebView。
+> 若系统缺少对应 WebView 运行时，请先安装（Windows 10/11 一般已自带 WebView2）。
 
-项目位于 `account/`，单包双 bin。
+## 功能
 
-### 后端（计算端）
+### 交易记录
+- 以「交易组」为单位记账：一个组可包含多条转入/转出记录，便于记录一次拆分消费
+- 支持跨月组：同一组的记录可以分布在不同月份
+- 按时间范围、交易对象筛选；进入页面自动刷新
+- 删除记录/整组前弹确认框并列出内容（防误删）
+
+### 交易对象与货币
+- 管理交易对象（如「支付宝」「微信钱包」「现金」）与货币（如 RMB、USD）
+- 新增记录时自动联动余额：转出方减少、转入方增加；删除时自动回滚
+- 禁止跨币种交易，避免金额被错误相加
+- 交易对象/货币均支持搜索；被引用的货币与交易对象不可删除
+
+### 数据统计
+- 选择多个交易对象与月份区间，查看每个对象的逐月收入、支出
+- **逐月结算余额**：从当前余额出发按月份倒推，得到每月月末余额
+- 双栏选择：左侧可搜索列表点「添加」，右侧已选列表可「踢出」
+
+### 导出 Excel（.xlsx）
+在「数据统计」页选择交易对象与月份后点击 **📤 导出交易记录**：
+
+1. 弹出确认框，列出导出的交易对象与时间区间（取消则中止导出）
+2. 确认后选择保存位置与文件名（Web 版由浏览器下载，只需填写文件名）
+3. 每个交易对象各自生成一个 sheet：
+   - 第 1 行：交易对象、时间区间、流水总额（转入合计 / 转出合计 / 净额）
+   - 第 2 行：表头，**默认开启自动筛选**，并冻结前两行
+   - 第 3 行起：流水明细（转出/转入、金额、货币类型、交易对象、交易日期、备注、交易分组、原始金额分子/分母）
+
+其中「金额」列由原始金额的分子/分母自动计算公式得出；交易日期为 Excel 日期时间格式，可直接按时间排序。
+
+### 版本更新提醒
+客户端**启动时检测一次** GitHub 最新发布版本，若比当前版本新则在侧边栏与提示浮层中告知（不会自动下载或跳转）。
+
+## 快速开始
+
+### 方式一：使用发布包（推荐）
+
+1. 在 [Releases](https://github.com/matt8848-max/account/releases) 下载对应平台的文件：
+   - `account-server-<平台>.zip` / `.tar.gz`：计算端
+   - `account-client-<平台>.zip` / `.tar.gz`：桌面客户端（内含安装包或可执行文件）
+   - `account-web-wasm.zip`：Web 版静态站点（可选）
+2. 先启动计算端 `server`（首次运行会在同目录创建 `account.db` 与自签名证书 `certs/`）
+3. 再启动客户端，输入后端地址 `https://127.0.0.2:3000` 并点击「连接」
+
+> 未签名的可执行文件可能触发系统提示：Windows 会出现 SmartScreen 提示（选择"仍要运行"）；
+> macOS 首次需右键「打开」，或执行 `xattr -dr com.apple.quarantine <应用路径>`。
+
+### 方式二：从源码构建
+
+环境要求：`cargo/rustc 1.88+`（edition 2024）、`dioxus-cli 0.7.10`、`wasm32-unknown-unknown` 目标（仅 Web 版需要）。
 
 ```bash
 cd account
-cargo build --bin server
 
-# 运行（默认 127.0.0.2:3000，数据库与 server 可执行文件同目录）
+# 计算端（默认 127.0.0.2:3000，数据库与 server 可执行文件同目录）
 cargo run --bin server
-
-# 指定监听 IP
-cargo run --bin server -- --ip 127.0.0.1
-
-# 指定数据库路径
-cargo run --bin server -- --db data/custom.db
-
-# 查看帮助
+cargo run --bin server -- --ip 127.0.0.1 --db data/custom.db
 cargo run --bin server -- --help
-```
 
-监听 `127.0.0.2:3000`。若 `certs/` 下无证书，首次启动会自动生成自签名证书并创建数据库（默认与 server 同目录的 `account.db`）。
-启动成功后终端输出：监听地址、API 版本、数据库版本、当前时间（UTC+8）。
-
-关闭后端：终端 `Ctrl+C`，或由客户端连接页的「关闭服务器」按钮（`POST /api/close`）优雅关闭。
-
-### 证书（手动生成，推荐）
-
-证书由 **mkcert** 手动生成，放置于 `account/certs/`（文件名固定为 `cert.pem` / `key.pem`）。
-
-```bash
-# 1. 安装 mkcert（一次即可）：
-#    Windows: choco install mkcert 或 winget install mkcert
-#    macOS:   brew install mkcert
-#    Linux:   sudo apt install mkcert
-
-# 2. 安装本地 CA（一次即可）
-mkcert -install
-
-# 3. 在 account/certs/ 目录生成证书
-#    域名列表按需填写：account.com、localhost、127.0.0.2、IPv6 地址（如 ::3000）等
-cd certs
-mkcert -cert-file cert.pem -key-file key.pem account.com account.com localhost 127.0.0.2 ::3000
-```
-
-生成后 `server` 启动时自动加载 `certs/cert.pem` 与 `certs/key.pem`；mkcert 的本地 CA 已被系统信任，浏览器/客户端访问 `https://127.0.0.2:3000` 不再有证书警告。
-
-### 前端（客户端）
-
-**Web（wasm）**：
-
-```bash
-cd account
-cargo build --target wasm32-unknown-unknown --bin client
-
-# 或使用 dioxus-cli 构建（必须指定 bin=client，默认找包名 account 会报错）
-dx build --release --platform web --bin client
-```
-
-**桌面（native）**：
-
-```bash
-cd account
+# 桌面客户端（开发运行）
 cargo run --bin client
-```
 
-桌面客户端启动后，在连接页输入后端地址（默认 `https://127.0.0.2:3000`），点击连接即可。
+# Web 版（开发 / 打包）
+cargo build --target wasm32-unknown-unknown --bin client
+dx build --release --platform web --bin client --features bundle
 
-## 构建打包（发布）
-
-打包使用 dioxus-cli（Dioxus.toml 已配置）。注意**必须同时满足**：
-
-1. 指定 `--bin client`（单包双 bin，默认找包名 account 会报错）
-2. 显式启用 `--features bundle`（Cargo.toml 中定义了 `bundle` 特性，`dx bundle` 需要）
-
-```bash
-cd account
-
-# 桌面应用安装包（NSIS）
+# 桌面安装包（Windows/macOS/Linux 各自在本机打包）
 dx bundle --release --platform desktop --bin client --features bundle
 ```
 
-打包后的 exe 安装程序位于 `target/dx/account/bundle/windows/nsis/` 目录下。
+## 使用说明
 
-其他平台/格式：
+1. **准备基础数据**：「对象/货币」页先建货币（如 RMB），再建交易对象并填写初始余额
+2. **记账**：在「交易记录」页新建交易组，填写组名与若干条转入/转出记录
+3. **查看**：按时间范围与交易对象筛选记录；交易对象余额随记录自动联动
+4. **统计**：在「数据统计」页选择对象与月份，点「🔍 查对象统计」
+5. **导出**：同一页面选择对象与月份后点「📤 导出交易记录」
+6. **关闭后端**：终端 `Ctrl+C`，或在连接页点「⛔ 关闭服务器」（需确认）
 
-```bash
-# Web 静态站点（部署到任意静态服务器即可，需先信任 https://127.0.0.2:3000 自签证书）
-dx bundle --release --platform web --bin client --features bundle
+## 数据与安全
 
-# 开发运行（Desktop）
-dx serve --platform desktop --bin client
+- **数据存储**：SQLite 单文件、按月分表，默认是 server 同目录下的 `account.db`（可用 `--db` 指定）
+- **传输安全**：HTTPS + HTTP/2；首次启动自动生成自签名证书到 `certs/`，也可用 mkcert 手动生成
+  （`cert.pem` / `key.pem`），此时浏览器访问不再有证书警告
+- 桌面客户端与后端之间会跳过自签证书校验（本地自用场景）
+- **建议定期备份** `account.db`；备份前先停止 server，避免遗漏 WAL 中的数据
 
-# 开发运行（Web 调试）
-dx serve --platform web --bin client
-```
+## 版本与发布（CI）
 
-> 提示：`dx bundle` 时若报 "Failed to find target account"，确认是否带 `--bin client --features bundle`。
+- 推送到 `main` 分支会触发 `.github/workflows/release.yml`
+- 版本号取自 `account/Cargo.toml`，工作流**自动以其作为 tag 创建 Release**（tag 已存在则只构建不发版）
+- 发布产物：计算端（Windows / Linux / macOS）、桌面客户端（Windows / Linux / macOS，macOS 含 Apple Silicon 与 Intel）、Web 版静态站点
 
-## 运行
-
-C/S 架构，需先启动**计算端（后端）**，再启动**客户端（前端）**。
-
-### 1. 启动后端
-
-```bash
-cd account
-cargo run --bin server
-```
-
-首次启动时若 `certs/` 下无证书会自动生成自签名证书，并创建数据库（`account.db`），监听 `https://127.0.0.2:3000`。保持此进程运行。（证书也可手动生成，见上文「证书（手动生成，推荐）」）
-
-### 2. 启动前端
-
-**桌面客户端（native，推荐即时验证）**：
+## 开发与测试
 
 ```bash
 cd account
-
-# 方式一：dioxus-cli 运行（自动构建 + 打开桌面窗口）
-dx serve --platform desktop --bin client
-
-# 方式二：cargo 直接运行
-cargo run --bin client
+cargo test                 # 单元测试（SQLite 内存库，不产生临时文件）
+cargo clippy --all-targets # 静态检查
+cargo fmt                  # 统一格式
 ```
 
-**Web 客户端（wasm）**：
-
-```bash
-cd account
-
-# 方式一：dioxus-cli serve（开发模式，热重载 + 自动打开浏览器）
-dx serve --platform web --bin client
-
-# 方式二：构建 + serve（生产构建）
-dx build --release --platform web --bin client && dx serve --platform web --bin client
-```
-
-启动后进入连接页，输入 `https://127.0.0.2:3000` 点击连接即可使用。
-
-> 提示：Windows cmd 下请使用 `cd /d account` 或 PowerShell 的 `Set-Location account` 保证目录切换生效（skill 记录的问题 B）；PowerShell 下 `RUST_LOG=debug` 需写作 `$env:RUST_LOG="debug"; cargo run --bin server`。
-
-## 测试
-
-```bash
-cd account
-cargo test
-```
-
-覆盖内容：
-
-- 定点数金额去零与加减精度对齐（1.3 + 2.7 = 4.0 → `(4, 1)`）
-- 统计页逐月结算余额倒推（含结束月过滤、汇总去零）
-- 货币增删查与删除约束（被交易对象/记录引用的货币不可删）
-- 交易对象删除约束
-- 交易组插入（跨月分表）与记录查询
-- 月度统计聚合（转入=收入、转出=支出，按货币分别统计）
-- 备注 256 字符长度校验、交易时间月份解析
-- 组 ID 按涉及月份分配 + 全局查重
-- 组包含月份（`group_months`）的写入与增删记录后的重算回写
-- 数据库迁移（版本 0/1 → 2 补列回填、升级规则、过旧版本拒绝）
-- 服务器 CLI 参数（默认 db 路径、东八区时间格式）
-
-**测试使用 SQLite 内存库**（`open_in_memory`），不会在项目目录产生任何临时文件。
-
-## 代码检查
-
-```bash
-cd account
-cargo check        # 快速类型检查（不生成二进制）
-cargo clippy       # 静态检查
-
-# 后端调试日志
-# PowerShell 7.3+ 或 bash：
-RUST_LOG=debug cargo run --bin server
-# PowerShell（所有版本）：
-$env:RUST_LOG="debug"; cargo run --bin server
-```
-
-## 项目结构
+代码结构（单包双 bin）：
 
 ```
 account/
-├── bin/server.rs    # 计算端（native，TLS + HTTP/2）
-├── bin/client.rs    # 客户端启动器（桌面 / Web）
+├── bin/server.rs   # 计算端（TLS + HTTP/2 + API 路由）
+├── bin/client.rs   # 客户端启动器（桌面 / Web）
 └── src/
-    ├── lib.rs       # 模块导出
-    ├── models.rs    # 数据模型（金额定点数等）
-    ├── api.rs       # HTTP API（PUT 读 / POST 其余）
-    ├── db.rs        # 数据库层（总表/货币/对象）
-    ├── db/month.rs  # 月表层（组/记录、月度统计）
-    └── ui.rs        # 客户端 UI 公共父模块（全局状态、HTTP、Toast、确认弹窗、主布局）
-        └── ui/      # 页面组件
-            ├── connect.rs  # 连接页
-            ├── records.rs  # 交易记录
-            ├── master.rs   # 交易对象/货币管理（搜索 + 灰白相间列表）
-            └── stats.rs    # 数据统计（双栏选择 + 逐月结算余额）
+    ├── models.rs   # 数据模型（金额定点数等）
+    ├── api.rs      # HTTP API（PUT 读 / POST 其余）
+    ├── db.rs       # 数据库层（总表 / 货币 / 交易对象）
+    ├── db/month.rs # 月表（组 / 记录 / 统计 / 迁移）
+    ├── export.rs   # xlsx 导出（纯逻辑，可单测）
+    └── ui.rs + ui/ # 客户端界面（连接页 / 记录 / 对象 / 统计 / 导出 / 更新检测）
 ```
 
-## 常见问题
+## 许可证
 
-| 问题 | 解决 |
-|---|---|
-| `database is locked` | 测试用内存库；多进程勿共享同一 SQLite 文件 |
-| 浏览器证书警告 | 自签证书，首次访问需手动信任 |
-| edition 2024 workspace 报 resolver | 根 Cargo.toml 显式写 `resolver = "3"` |
-| Windows cmd 中包建到错误目录 | 避免 `cd dir && cargo xxx`，用 `--manifest-path` |
-| PowerShell 中 `RUST_LOG=debug cargo` 报错 | Unix 语法不适用；用 `$env:RUST_LOG="debug"; cargo ...` |
-| `dx build` 报 "Failed to find target account" | 单包双 bin 项目，需加 `--bin client` |
-| `dx bundle` 报 "Failed to find target account" | 单包双 bin 项目，需加 `--bin client --features bundle` |
+本项目以 **MIT** 协议开源，详见 [LICENSE](LICENSE)。

@@ -1,0 +1,260 @@
+name: Build & Release
+
+# 只对 main 分支构建发布：tag 由 account/Cargo.toml 的 version 自动生成（tag 就是版本号，不带 v 前缀）。
+# tag 已存在时只构建不重复发版（幂等），因此 main 上多次提交不会产生重复 release。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # 与本地开发使用的 dioxus-cli 保持一致
+  DX_VERSION: 0.7.10
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    name: 读取版本号
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag_exists: ${{ steps.check.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: version
+        name: 从 Cargo.toml 读取版本号（即发布 tag）
+        run: |
+          version=$(grep -m1 '^version = ' account/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$version" ]; then
+            echo "未能从 account/Cargo.toml 读取 version" >&2
+            exit 1
+          fi
+          echo "版本号: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - id: check
+        name: 检查同名 tag 是否已存在
+        run: |
+          if git ls-remote --tags origin "refs/tags/${{ steps.version.outputs.version }}" | grep -q .; then
+            echo "tag ${{ steps.version.outputs.version }} 已存在，本次只构建不发版"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  server:
+    name: 计算端 ${{ matrix.asset }}
+    needs: meta
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, asset: windows-x64, arch: x86_64-pc-windows-msvc }
+          - { os: ubuntu-latest, asset: linux-x64, arch: x86_64-unknown-linux-gnu }
+          - { os: macos-14, asset: macos-arm64, arch: aarch64-apple-darwin }
+          - { os: macos-13, asset: macos-x64, arch: x86_64-apple-darwin }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: account
+
+      - name: 构建 server（release）
+        working-directory: account
+        run: cargo build --release --bin server --target ${{ matrix.arch }}
+
+      - name: 打包产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          bin="account/target/${{ matrix.arch }}/release/server"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            bin="$bin.exe"
+          fi
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            powershell -Command "Compress-Archive -Path '$bin' -DestinationPath 'dist/account-server-${{ matrix.asset }}.zip' -Force"
+          else
+            tar -czf "dist/account-server-${{ matrix.asset }}.tar.gz" -C "$(dirname "$bin")" "$(basename "$bin")"
+          fi
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+  desktop:
+    name: 桌面客户端 ${{ matrix.asset }}
+    needs: meta
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, asset: windows-x64, package_type: nsis }
+          - { os: ubuntu-latest, asset: linux-x64, package_type: deb }
+          - { os: macos-14, asset: macos-arm64, package_type: macos }
+          - { os: macos-13, asset: macos-x64, package_type: macos }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: 安装 Linux 桌面依赖（使用系统自带 WebKitGTK，不自带 webview）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: account
+
+      - name: 缓存 dioxus-cli
+        id: dx-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/dx*
+          key: dx-${{ env.DX_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: 安装 dioxus-cli
+        if: steps.dx-cache.outputs.cache-hit != 'true'
+        run: cargo install dioxus-cli --version ${{ env.DX_VERSION }} --locked
+
+      # 最小化包：Dioxus.toml 已配置 webview_install_mode = "Skip"，
+      # Windows 不内嵌 WebView2 运行时，Linux/macOS 使用系统 WebView。
+      - name: 构建桌面客户端（裸二进制）
+        working-directory: account
+        run: cargo build --release --bin client
+
+      - name: 生成安装包 / .app（打包器失败不影响发布，仍会附带裸二进制）
+        working-directory: account
+        continue-on-error: true
+        run: dx bundle --release --platform desktop --bin client --features bundle --package-types ${{ matrix.package_type }}
+
+      - name: 归档客户端产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="account-client-${{ matrix.asset }}"
+          mkdir -p dist stage
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp account/target/release/client.exe stage/
+          else
+            cp account/target/release/client stage/
+          fi
+          # dx 打包产物：安装包（.exe/.msi/.deb）与 macOS .app
+          find account/target/dx -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.deb' \) -exec cp {} stage/ \; 2>/dev/null || true
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            find account/target/dx -maxdepth 7 -type d -name '*.app' -exec cp -R {} stage/ \; 2>/dev/null || true
+          fi
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            powershell -Command "Compress-Archive -Path 'stage/*' -DestinationPath 'dist/$name.zip' -Force"
+          else
+            tar -czf "dist/$name.tar.gz" -C stage .
+          fi
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-desktop-${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+  wasm:
+    name: Web 客户端 wasm
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: account
+
+      - name: 缓存 dioxus-cli
+        id: dx-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/dx*
+          key: dx-${{ env.DX_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: 安装 dioxus-cli
+        if: steps.dx-cache.outputs.cache-hit != 'true'
+        run: cargo install dioxus-cli --version ${{ env.DX_VERSION }} --locked
+
+      - name: 构建 Web 客户端
+        working-directory: account
+        run: dx build --release --platform web --bin client --features bundle
+
+      - name: 归档 Web 静态站点
+        shell: bash
+        run: |
+          set -euo pipefail
+          public_dir=$(find account/target/dx -type d -path '*/release/web/public' | head -n1)
+          if [ -z "$public_dir" ]; then
+            echo "未找到 web 构建输出目录 public" >&2
+            find account/target/dx -maxdepth 4 -type d | sort
+            exit 1
+          fi
+          mkdir -p dist
+          (cd "$public_dir" && zip -r "$GITHUB_WORKSPACE/dist/account-web-wasm.zip" .)
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-web-wasm
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: 发布 Release（tag = Cargo 版本号）
+    needs: [meta, server, desktop, wasm]
+    # tag 已存在则跳过，保证 main 上多次提交不会重复发版
+    if: needs.meta.outputs.tag_exists == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 列出待发布文件
+        run: find artifacts -type f | sort
+
+      - name: 创建 Release 并上传三端产物
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.version }}
+          name: ${{ needs.meta.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.tar.gz

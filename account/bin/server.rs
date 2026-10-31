@@ -85,9 +85,7 @@ mod imp {
                     db = PathBuf::from(v);
                 }
                 other => {
-                    return Err(anyhow::anyhow!(
-                        "未知参数: {other}（使用 --help 查看帮助）"
-                    ));
+                    return Err(anyhow::anyhow!("未知参数: {other}（使用 --help 查看帮助）"));
                 }
             }
         }
@@ -115,14 +113,27 @@ mod imp {
             .unwrap_or_else(|| PathBuf::from(DB_FILE_NAME))
     }
 
-    /// 当前时间（UTC+8，即东八区时间）
-    fn now_utc8() -> String {
-        // 固定使用 +08:00 偏移，不依赖系统时区
-        let offset = chrono::FixedOffset::east_opt(8 * 3600).expect("固定时区偏移合法");
-        chrono::Utc::now()
-            .with_timezone(&offset)
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string()
+    /// 当前本地时间，形如 `UTC+8 2026-10-31 12:34:56`。
+    ///
+    /// 时区取自**系统时区**而非固定东八区：server 只编译为 native 目标，
+    /// 因此可以直接使用 `chrono::Local`（wasm 无系统时区概念，不在此列）。
+    fn now_local() -> String {
+        use chrono::Offset;
+
+        let now = chrono::Local::now();
+        // local_minus_utc() 给出相对 UTC 的秒数（含夏令时），据此拼出 UTC±H[:MM] 标签
+        let offset_secs = now.offset().fix().local_minus_utc();
+        let sign = if offset_secs < 0 { '-' } else { '+' };
+        let abs = offset_secs.unsigned_abs();
+        let hours = abs / 3600;
+        let minutes = (abs % 3600) / 60;
+        // 整点时区省略分钟（UTC+8），半小时/45 分钟时区保留两位分钟（UTC+5:30）
+        let zone = if minutes == 0 {
+            format!("UTC{sign}{hours}")
+        } else {
+            format!("UTC{sign}{hours}:{minutes:02}")
+        };
+        format!("{zone} {}", now.format("%Y-%m-%d %H:%M:%S"))
     }
 
     pub async fn run() -> Result<()> {
@@ -131,8 +142,8 @@ mod imp {
         };
 
         // 打开数据库（默认与 server 同目录）
-        let conn = db::open(&cli.db)
-            .with_context(|| format!("初始化数据库失败: {}", cli.db.display()))?;
+        let conn =
+            db::open(&cli.db).with_context(|| format!("初始化数据库失败: {}", cli.db.display()))?;
         let db_ver = db::db_version(&conn)?;
         log::info!("数据库已就绪: {}", cli.db.display());
 
@@ -154,7 +165,7 @@ mod imp {
         log::info!("记账计算端启动: https://{addr} (HTTP/2.0)");
         log::info!("API 版本: {}", api::API_VERSION);
         log::info!("数据库版本: {db_ver}");
-        log::info!("当前时间 (UTC+8): {}", now_utc8());
+        log::info!("当前时间: {}", now_local());
 
         axum_server::bind_rustls(addr, tls_config)
             .handle(shutdown_handle)
@@ -212,16 +223,41 @@ mod imp {
             );
         }
 
-        /// 验证东八区时间格式：`YYYY-MM-DD HH:MM:SS`
+        /// 验证本地时间格式：`UTC±H[:MM] YYYY-MM-DD HH:MM:SS`。
+        ///
+        /// 时区标签取自系统时区（不硬编码东八区，非东八区/夏令时机器同样应通过），
+        /// 时间部分固定 19 个字符且分隔符位置正确。
         #[test]
-        fn now_utc8_format() {
-            let s = now_utc8();
-            assert_eq!(s.len(), 19, "时间字符串长度应为 19，实际 {s}");
-            assert_eq!(&s[4..5], "-");
-            assert_eq!(&s[7..8], "-");
-            assert_eq!(&s[10..11], " ");
-            assert_eq!(&s[13..14], ":");
-            assert_eq!(&s[16..17], ":");
+        fn now_local_format() {
+            let s = now_local();
+            let (zone, time) = s.split_once(' ').expect("应包含时区标签与时间两部分");
+            assert!(
+                zone.starts_with("UTC+") || zone.starts_with("UTC-"),
+                "时区标签应以 UTC± 开头，实际 {zone}"
+            );
+            // 符号之后：`8` 或 `5:30` 形式（整点时区省略分钟）
+            let rest = &zone[3..];
+            let digits = &rest[1..];
+            let (hours, minutes) = match digits.split_once(':') {
+                Some((h, m)) => (h, m),
+                None => (digits, "00"),
+            };
+            assert!(
+                !hours.is_empty() && hours.chars().all(|c| c.is_ascii_digit()),
+                "小时部分非法: {zone}"
+            );
+            assert_eq!(minutes.len(), 2, "分钟部分应为两位: {zone}");
+            assert!(
+                minutes.chars().all(|c| c.is_ascii_digit()),
+                "分钟部分非法: {zone}"
+            );
+
+            assert_eq!(time.len(), 19, "时间字符串长度应为 19，实际 {time}");
+            assert_eq!(&time[4..5], "-");
+            assert_eq!(&time[7..8], "-");
+            assert_eq!(&time[10..11], " ");
+            assert_eq!(&time[13..14], ":");
+            assert_eq!(&time[16..17], ":");
         }
     }
 }
