@@ -6,15 +6,12 @@
 //! - `currencies` — 货币表
 //! - `counterparties` — 交易对象表
 
-use crate::models::{MonthMeta, MonthStats, Money};
+use crate::models::{Money, MonthMeta, MonthStats};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::Path;
 
 pub mod month;
-
-/// 数据库文件名
-pub const DB_FILE: &str = "account.db";
 
 /// 数据库 Schema 当前版本
 ///
@@ -108,8 +105,10 @@ fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
             )
             .unwrap_or(false);
         if !has {
-            conn.execute_batch(&format!("ALTER TABLE `{table}` ADD COLUMN group_months TEXT;"))
-                .with_context(|| format!("旧月表 `{table}` 补加 group_months 列失败"))?;
+            conn.execute_batch(&format!(
+                "ALTER TABLE `{table}` ADD COLUMN group_months TEXT;"
+            ))
+            .with_context(|| format!("旧月表 `{table}` 补加 group_months 列失败"))?;
             log::info!("旧月表 `{table}` 已补加 group_months 列");
         }
     }
@@ -118,12 +117,8 @@ fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
     let mut group_months: std::collections::HashMap<i64, std::collections::BTreeSet<String>> =
         std::collections::HashMap::new();
     for table in &tables {
-        let mut stmt = conn.prepare(&format!(
-            "SELECT group_id, traded_at FROM `{table}`"
-        ))?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        })?;
+        let mut stmt = conn.prepare(&format!("SELECT group_id, traded_at FROM `{table}`"))?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         for row in rows {
             let (gid, traded_at) = row?;
             let month = month::month_of(&traded_at).to_string();
@@ -231,8 +226,10 @@ pub fn ensure_month_table(conn: &Connection, month: &str) -> Result<String> {
         )
         .unwrap_or(false);
     if !has_name {
-        conn.execute_batch(&format!("ALTER TABLE `{table}` ADD COLUMN group_name TEXT;"))
-            .with_context(|| format!("月表 `{table}` 补加 group_name 失败"))?;
+        conn.execute_batch(&format!(
+            "ALTER TABLE `{table}` ADD COLUMN group_name TEXT;"
+        ))
+        .with_context(|| format!("月表 `{table}` 补加 group_name 失败"))?;
     }
     let has_months: bool = conn
         .query_row(
@@ -244,8 +241,10 @@ pub fn ensure_month_table(conn: &Connection, month: &str) -> Result<String> {
         )
         .unwrap_or(false);
     if !has_months {
-        conn.execute_batch(&format!("ALTER TABLE `{table}` ADD COLUMN group_months TEXT;"))
-            .with_context(|| format!("月表 `{table}` 补加 group_months 失败"))?;
+        conn.execute_batch(&format!(
+            "ALTER TABLE `{table}` ADD COLUMN group_months TEXT;"
+        ))
+        .with_context(|| format!("月表 `{table}` 补加 group_months 失败"))?;
     }
     Ok(table)
 }
@@ -397,15 +396,15 @@ pub fn upsert_month_stats(conn: &Connection, meta: &MonthMeta) -> Result<()> {
 
 /// 查询全部月份统计（按月份排序）
 pub fn list_month_stats(conn: &Connection) -> Result<Vec<MonthMeta>> {
-    let mut stmt = conn.prepare(
-        "SELECT month, table_name, stats FROM total_stats ORDER BY month",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT month, table_name, stats FROM total_stats ORDER BY month")?;
     let rows = stmt.query_map([], |r| {
         let month: String = r.get(0)?;
         let table_name: String = r.get(1)?;
         let stats_json: String = r.get(2)?;
-        let stats: MonthStats = serde_json::from_str(&stats_json)
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?;
+        let stats: MonthStats = serde_json::from_str(&stats_json).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+        })?;
         Ok(MonthMeta {
             month,
             table_name,
@@ -421,15 +420,15 @@ pub fn list_month_stats(conn: &Connection) -> Result<Vec<MonthMeta>> {
 
 /// 查询单个月份统计
 pub fn get_month_stats(conn: &Connection, month: &str) -> Result<Option<MonthMeta>> {
-    let mut stmt = conn.prepare(
-        "SELECT month, table_name, stats FROM total_stats WHERE month = ?1",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT month, table_name, stats FROM total_stats WHERE month = ?1")?;
     let mut rows = stmt.query_map([month], |r| {
         let month: String = r.get(0)?;
         let table_name: String = r.get(1)?;
         let stats_json: String = r.get(2)?;
-        let stats: MonthStats = serde_json::from_str(&stats_json)
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?;
+        let stats: MonthStats = serde_json::from_str(&stats_json).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+        })?;
         Ok(MonthMeta {
             month,
             table_name,
@@ -527,7 +526,9 @@ mod tests {
         let conn = test_conn();
         // 模拟"最开始忘了版本控制的版本"：user_version 为 0。
         // 版本 0 与 1 结构相同，0 → 2 是合法升级（补列 group_months 并回填）。
-        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, 0);
         migrate(&conn).unwrap();
         assert_eq!(db_version(&conn).unwrap(), DB_VERSION);

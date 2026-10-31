@@ -8,7 +8,9 @@
 //! - `ui/connect.rs` — 连接页（含关闭服务器按钮）
 //! - `ui/records.rs` — 交易记录浏览器
 //! - `ui/master.rs`  — 交易对象/货币管理
-//! - `ui/stats.rs`   — 数据统计
+//! - `ui/stats.rs`   — 数据统计（含导出入口）
+//! - `ui/export.rs`  — 导出保存对话框（Web 下载 / 桌面另存为）
+//! - `ui/update.rs`  — 启动时检测 GitHub 新版本
 //!
 //! 跨页公用的代码（全局状态、HTTP 封装、提示、确认弹窗等）保留在本文件。
 
@@ -19,9 +21,11 @@ use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 
 pub mod connect;
+pub mod export;
 pub mod master;
 pub mod records;
 pub mod stats;
+pub mod update;
 
 // 让父模块（ui.rs）中的页面切换能直接引用子模块组件
 pub(crate) use connect::ConnectPage;
@@ -43,7 +47,11 @@ pub struct RecordView {
     /// 组包含的所有月份（逗号分隔，如 `2026-08,2026-09`）
     pub group_months: Option<String>,
     pub from: String,
+    /// 转出对象 ID（导出时用于判断方向）
+    pub from_id: i64,
     pub to: String,
+    /// 转入对象 ID（导出时用于判断方向）
+    pub to_id: i64,
     pub amount: Money,
     pub currency: String,
     pub remark: Option<String>,
@@ -126,6 +134,10 @@ pub(crate) struct GlobalState {
     pub stats_cp: Signal<Vec<i64>>,
     /// 轻提示（Toast）内容
     pub toast: Signal<Option<String>>,
+    /// 启动时检测到的新版本提示（None 表示已是最新 / 未检测到 / 该功能未启用）
+    pub update_hint: Signal<Option<String>>,
+    /// 新版本发布页地址（供用户手动访问，None 表示无）
+    pub release_url: Signal<Option<String>>,
 }
 
 /// 新建组草稿行（表单编辑用）
@@ -149,6 +161,12 @@ impl GroupDraftRow {
             remark: String::new(),
             traded_at: now_local_iso(),
         }
+    }
+}
+
+impl Default for GroupDraftRow {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -283,6 +301,30 @@ pub(crate) fn DayTimeInput(value: String, onchange: EventHandler<String>) -> Ele
     }
 }
 
+/// 取当前选中项的标签；未匹配时返回空串。
+///
+/// `value = 0` 且候选中含 `(0, empty_label)` 时返回该标签（如「全部」）；
+/// 返回空串表示"没有可展示的选中项"，调用方应回退到传入的 placeholder。
+pub(crate) fn selected_label_of(candidates: &[(i64, String)], value: i64) -> String {
+    candidates
+        .iter()
+        .find(|(id, _)| *id == value)
+        .map(|(_, label)| label.clone())
+        .unwrap_or_default()
+}
+
+/// 按关键字过滤候选：标签子串匹配、忽略大小写；关键字为空（或全空白）时返回全部候选。
+///
+/// 只匹配标签不匹配数值：用户按对象名/货币名搜索（如「微信」）。
+pub(crate) fn filter_candidates(candidates: &[(i64, String)], query: &str) -> Vec<(i64, String)> {
+    let q = query.trim().to_lowercase();
+    candidates
+        .iter()
+        .filter(|(_, label)| q.is_empty() || label.to_lowercase().contains(&q))
+        .cloned()
+        .collect()
+}
+
 /// 搜索 + 候选选择组件
 ///
 /// 原生 `<select>` 不支持搜索，此组件提供输入框关键字过滤 + 候选列表选择：
@@ -317,20 +359,11 @@ pub(crate) fn SearchSelect(
     }
     all_candidates.extend(candidates);
 
-    // 当前选中项标签（用于输入框展示；搜索中则展示搜索词）
-    let selected_label = all_candidates
-        .iter()
-        .find(|(id, _)| *id == value)
-        .map(|(_, label)| label.clone())
-        .unwrap_or_default();
+    // 当前选中项标签：仅用于 placeholder 展示（绝不写回输入框 value）
+    let selected_label = selected_label_of(&all_candidates, value);
 
     // 过滤候选：按标签子串匹配（忽略大小写）
-    let q = query().to_lowercase();
-    let filtered: Vec<(i64, String)> = all_candidates
-        .iter()
-        .filter(|(_, label)| q.is_empty() || label.to_lowercase().contains(&q))
-        .cloned()
-        .collect();
+    let filtered: Vec<(i64, String)> = filter_candidates(&all_candidates, &query());
 
     // 高亮索引（渲染时收敛到有效范围，避免过滤后越界）
     let highlight_idx = {
@@ -346,10 +379,24 @@ pub(crate) fn SearchSelect(
     let filtered_for_keys = filtered.clone();
 
     rsx! {
-        div { style: "position:relative;display:inline-block;min-width:150px;vertical-align:middle",
+        div {
+            style: "position:relative;display:inline-block;min-width:150px;vertical-align:middle",
+            // 焦点离开本组件（点击页面其他位置）→ 收起候选并丢弃临时搜索词
+            // （历史 bug：此前点击别处候选栏不会关闭）
+            onfocusout: move |_| {
+                open.set(false);
+                query.set(String::new());
+            },
             input {
-                value: if query().is_empty() { selected_label } else { query() },
-                placeholder: placeholder,
+                // value 只绑定用户输入，禁止回填已选标签：
+                // 旧实现把选中标签写进 value，用户删除文本后又被渲染填回（历史 bug）
+                value: query(),
+                // 未输入时用 placeholder 呈现当前选中项（灰字提示，不参与编辑）
+                placeholder: if selected_label.is_empty() {
+                    placeholder
+                } else {
+                    selected_label
+                },
                 oninput: move |e| {
                     query.set(e.value());
                     open.set(true);
@@ -377,6 +424,10 @@ pub(crate) fn SearchSelect(
                         }
                         query.set(String::new());
                         open.set(false);
+                    } else if code == "Escape" {
+                        // Esc：收起候选并清空临时搜索词
+                        open.set(false);
+                        query.set(String::new());
                     }
                 },
             }
@@ -389,7 +440,10 @@ pub(crate) fn SearchSelect(
                                 "padding:4px 8px;cursor:pointer;background:{}",
                                 if idx == highlight_idx || id == value { "#eef" } else { "#fff" }
                             ),
-                            onclick: move |_| {
+                            // 用 mousedown 而非 click：click 之前输入框会先失焦，
+                            // 候选列表可能已被卸载导致本次点击丢失；prevent_default 阻止失焦
+                            onmousedown: move |e| {
+                                e.prevent_default();
                                 onchange.call(id);
                                 query.set(String::new());
                                 open.set(false);
@@ -491,6 +545,53 @@ pub(crate) async fn http_post(
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     http_request("POST", base, path, body).await
+}
+
+/// GET 绝对 URL（用于 GitHub Releases 等外部接口）。
+///
+/// - wasm：gloo-net（浏览器禁止自定义 `User-Agent`，故只在桌面端设置）
+/// - native：reqwest，按 GitHub 要求带 `User-Agent`
+pub(crate) async fn http_get(url: &str) -> Result<serde_json::Value, String> {
+    http_get_impl(url).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn http_get_impl(url: &str) -> Result<serde_json::Value, String> {
+    use gloo_net::http::Request;
+
+    let req = Request::get(url).header("Accept", "application/vnd.github+json");
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if status >= 400 {
+        return Err(format!("HTTP {status}: {text}"));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("解析响应失败: {e}"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn http_get_impl(url: &str) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true) // 与 PUT/POST 保持一致（自签名证书场景）
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(url)
+        // GitHub API 要求必须带 User-Agent
+        .header(
+            "User-Agent",
+            concat!("account-client/", env!("CARGO_PKG_VERSION")),
+        )
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if status.as_u16() >= 400 {
+        return Err(format!("HTTP {status}: {text}"));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("解析响应失败: {e}"))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -706,10 +807,14 @@ pub fn App() -> Element {
         stats_to: use_signal(String::new),
         stats_cp: use_signal(Vec::new),
         toast: use_signal(|| None),
+        update_hint: use_signal(|| None),
+        release_url: use_signal(|| None),
     };
     use_context_provider(move || state);
 
     let st = use_context::<GlobalState>();
+    // 启动时检测一次 GitHub 是否发布了新版本（只提示，不阻塞任何流程）
+    use_effect(move || update::spawn_check(st));
     // 显示连接页的情形：尚未连接，或用户主动从主界面切回连接页（保持 connected 不变）
     if (st.show_connect)() || !(st.connected)() {
         rsx! {
@@ -750,6 +855,10 @@ fn MainLayout() -> Element {
     let live_at_text = (st.live_at)();
     let api_version_text = (st.api_version)();
     let toast_msg = (st.toast)();
+    // 启动时检测到的新版本提示（None 表示已最新/未检测到），由根组件一次性写入
+    let update_hint_text = (st.update_hint)();
+    let release_page_text = (st.release_url)().unwrap_or_default();
+    let has_release_page = !release_page_text.is_empty();
 
     rsx! {
         div {
@@ -759,6 +868,15 @@ fn MainLayout() -> Element {
             aside { style: "width:200px;border-right:1px solid #ddd;padding:10px;display:flex;flex-direction:column;flex-shrink:0",
                 h2 { "记账软件" }
                 div { style: "font-size:12px;color:#888;margin-bottom:8px", "版本 {api_version_text}" }
+                // 有新版本时给出提示与发布页地址（不自动跳转，避免桌面端 webview 被导航走）
+                if let Some(hint) = &update_hint_text {
+                    div { style: "font-size:12px;color:#c0392b;margin-bottom:8px",
+                        "{hint}"
+                        if has_release_page {
+                            div { style: "color:#7f8c8d;word-break:break-all", "{release_page_text}" }
+                        }
+                    }
+                }
                 nav { style: "display:flex;flex-direction:column;gap:8px",
                     button { onclick: move |_| st.page.set(Page::Records), "📒 交易记录" }
                     button { onclick: move |_| st.page.set(Page::Master), "🏦 对象/货币" }
@@ -787,5 +905,62 @@ fn MainLayout() -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{filter_candidates, selected_label_of};
+
+    /// 候选项集合（含「全部」项，值 0）
+    fn candidates() -> Vec<(i64, String)> {
+        vec![
+            (0, "全部".to_string()),
+            (1, "支付宝 (RMB)".to_string()),
+            (2, "微信钱包 (RMB)".to_string()),
+            (3, "Bank (USD)".to_string()),
+        ]
+    }
+
+    /// 验证选中项标签：`value = 0` 取「全部」，未匹配返回空串（调用方回退 placeholder）
+    #[test]
+    fn selected_label_should_return_matched_label_or_empty() {
+        let all = candidates();
+        assert_eq!(selected_label_of(&all, 0), "全部");
+        assert_eq!(selected_label_of(&all, 2), "微信钱包 (RMB)");
+        // 未匹配：空串，前端回退到传入的 placeholder，不会显示错误标签
+        assert_eq!(selected_label_of(&all, 999), "");
+        assert_eq!(selected_label_of(&[], 0), "");
+    }
+
+    /// 验证关键字过滤：空/全空白关键字返回全部候选（下拉默认展示所有项）
+    #[test]
+    fn filter_candidates_should_return_all_on_empty_query() {
+        let all = candidates();
+        assert_eq!(filter_candidates(&all, "").len(), all.len());
+        assert_eq!(filter_candidates(&all, "   ").len(), all.len());
+    }
+
+    /// 验证关键字过滤：标签子串匹配且忽略大小写（中英文混排标签同样适用）
+    #[test]
+    fn filter_candidates_should_match_label_case_insensitively() {
+        let all = candidates();
+        let hit = filter_candidates(&all, "微信");
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].0, 2);
+
+        // 大小写不敏感：bank / BANK 均命中 (3, "Bank (USD)")
+        assert_eq!(filter_candidates(&all, "bank")[0].0, 3);
+        assert_eq!(filter_candidates(&all, "BANK")[0].0, 3);
+        // 关键字带空格也能命中（trim 后按子串匹配）
+        assert_eq!(filter_candidates(&all, " 支付宝 ")[0].0, 1);
+    }
+
+    /// 验证关键字过滤：无匹配时返回空集合（下拉展示「无匹配候选」）
+    #[test]
+    fn filter_candidates_should_return_empty_when_no_match() {
+        let all = candidates();
+        assert!(filter_candidates(&all, "不存在的对象").is_empty());
+        assert!(filter_candidates(&[], "支付宝").is_empty());
     }
 }
