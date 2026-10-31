@@ -308,8 +308,13 @@ cargo install dioxus-cli --version 0.7.10
 ## 发布流程（CI）
 
 - 推送 `main` 分支 → `.github/workflows/release.yml` 自动构建：
-  计算端（Windows/Linux/macOS，含 macOS x64/arm64）、桌面客户端（同上，最小化包：`Dioxus.toml` 的
-  `webview_install_mode = "Skip"` 表示不自带 WebView2）、Web 版（wasm）
+  计算端与桌面客户端（Windows x64 / Linux x64 / **macOS arm64**，Intel macOS 已停发）、Web 版（wasm）；
+  桌面客户端为最小化包（`Dioxus.toml` 的 `webview_install_mode = "Skip"` 表示不自带 WebView2）
+- Linux 作业必须先装 GTK/WebKit 开发库并断言 `pkg-config --modversion glib-2.0 / webkit2gtk-4.1`：
+  server 与 client 共享同一个 lib（含 `ui` 模块），编译 lib 时会一并编译 dioxus-desktop，
+  缺库会报 `glib-sys` 的 pkg-config 错误
+- 工作流使用 Node 24 版 action（`checkout@v7` / `cache@v6` / `upload-artifact@v7` / `download-artifact@v8`），
+  避免 Node 20 弃用告警
 - `meta` 作业从 `account/Cargo.toml` 读取 `version` 作为 **tag（不带 v 前缀）**；
   用 `git ls-remote --tags` 判断 tag 是否已存在，已存在则只构建不发版（幂等）
 - 发版由 `softprops/action-gh-release` 完成（需要 `permissions: contents: write`）
