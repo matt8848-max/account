@@ -75,31 +75,32 @@
 
 环境要求：`cargo/rustc 1.88+`（edition 2024）、`dioxus-cli 0.7.10`、`wasm32-unknown-unknown` 目标（仅 Web 版需要）。
 
-**Linux 额外系统依赖**（server 与 client 共用同一个 lib，含 UI 模块，因此编译 server 也需要）：
+**Linux 额外系统依赖**（仅**客户端**需要；server 不启用 `client` 特性，依赖图里没有 GUI 库，无需安装）：
 
 ```bash
 sudo apt-get install -y pkg-config libglib2.0-dev libgtk-3-dev \
   libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
-  libayatana-appindicator3-dev librsvg2-dev patchelf
+  libayatana-appindicator3-dev libxdo-dev librsvg2-dev patchelf
 ```
 
 ```bash
 cd account
 
 # 计算端（默认 127.0.0.2:3000，数据库与 server 可执行文件同目录）
+# 不需要 client 特性，也不会编译/链接任何 GUI 代码
 cargo run --bin server
 cargo run --bin server -- --ip 127.0.0.1 --db data/custom.db
 cargo run --bin server -- --help
 
-# 桌面客户端（开发运行）
-cargo run --bin client
+# 桌面客户端（开发运行，需要 client 特性）
+cargo run --bin client --features client
 
 # Web 版（开发 / 打包）
-cargo build --target wasm32-unknown-unknown --bin client
-dx build --release --platform web --bin client --features bundle
+cargo build --target wasm32-unknown-unknown --bin client --features client
+dx build --release --platform web --bin client --features bundle,client
 
 # 桌面安装包（Windows/macOS/Linux 各自在本机打包）
-dx bundle --release --platform desktop --bin client --features bundle
+dx bundle --release --platform desktop --bin client --features bundle,client
 ```
 
 ## 使用说明
@@ -129,24 +130,28 @@ dx bundle --release --platform desktop --bin client --features bundle
 
 ```bash
 cd account
-cargo test                 # 单元测试（SQLite 内存库，不产生临时文件）
-cargo clippy --all-targets # 静态检查
-cargo fmt                  # 统一格式
+cargo test --features client    # 单元测试（含 UI/导出用例；SQLite 内存库，不产生临时文件）
+cargo clippy --all-targets --features client   # 静态检查
+cargo fmt                       # 统一格式
 ```
+
+> `ui` 模块与客户端 bin 都在 `client` 特性下编译（`[[bin]] client` 声明了 `required-features`），
+> 因此编译 server 时不会触碰 dioxus / GTK / WebKit；`cargo test` 若不加 `--features client` 只会跑
+> 与 UI 无关的用例。
 
 代码结构（单包双 bin）：
 
 ```
 account/
-├── bin/server.rs   # 计算端（TLS + HTTP/2 + API 路由）
-├── bin/client.rs   # 客户端启动器（桌面 / Web）
+├── bin/server.rs   # 计算端（TLS + HTTP/2 + API 路由；不依赖 GUI）
+├── bin/client.rs   # 客户端启动器（桌面 / Web，需 client 特性）
 └── src/
     ├── models.rs   # 数据模型（金额定点数等）
     ├── api.rs      # HTTP API（PUT 读 / POST 其余）
     ├── db.rs       # 数据库层（总表 / 货币 / 交易对象）
     ├── db/month.rs # 月表（组 / 记录 / 统计 / 迁移）
     ├── export.rs   # xlsx 导出（纯逻辑，可单测）
-    └── ui.rs + ui/ # 客户端界面（连接页 / 记录 / 对象 / 统计 / 导出 / 更新检测）
+    └── ui.rs + ui/ # 客户端界面（client 特性：连接 / 记录 / 对象 / 统计 / 导出 / 更新检测）
 ```
 
 ## 许可证

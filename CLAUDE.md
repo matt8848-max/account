@@ -55,8 +55,11 @@
 ```
 
 **依赖 target 分离**：
-- `[target.'cfg(not(target_arch = "wasm32"))']` — axum/axum-server/rusqlite(bundled)/tokio/reqwest/dioxus(desktop)/rcgen/rfd/rust_xlsxwriter
-- `[target.wasm32-unknown-unknown]` — dioxus(web)/gloo-net/gloo-timers/web-sys/wasm-bindgen/rust_xlsxwriter(wasm feature)
+- `[target.'cfg(not(target_arch = "wasm32"))']` — axum/axum-server/rusqlite(bundled)/tokio/reqwest/rcgen/rust_xlsxwriter；
+  `dioxus(desktop)` 与 `rfd` 为 **optional**，仅 `client` 特性启用
+- `[target.wasm32-unknown-unknown]` — rust_xlsxwriter(wasm feature)；`dioxus(web)/gloo-net/gloo-timers/web-sys/wasm-bindgen/js-sys` 均为 **optional**，仅 `client` 特性启用
+- **`client` 特性**：开启后才编译 `src/ui.rs`（`#[cfg(feature = "client")]`）与 `[[bin]] client`
+  （`required-features = ["client"]`），因此 server 的依赖图里**没有** dioxus/GTK/WebKit
 
 ## 架构与数据流
 
@@ -288,18 +291,18 @@ cargo run --bin server -- --ip 127.0.0.1        # 指定监听 IP
 cargo run --bin server -- --db data/custom.db   # 指定数据库路径
 cargo run --bin server -- --help                # 查看帮助
 
-cargo test                          # 运行单元测试（69 个，含导出/更新检测/时区）
-cargo clippy --all-targets           # 静态检查
+cargo test --features client         # 运行单元测试（69 个，含 UI/导出/更新检测/时区）
+cargo clippy --all-targets --features client  # 静态检查
 
 # 打开调试日志（PowerShell：$env:RUST_LOG="debug"; cargo run --bin server）
 $env:RUST_LOG="debug"; cargo run --bin server
 
-# 前端
-cargo check --target wasm32-unknown-unknown --bin client   # wasm 类型检查
-cargo build --target wasm32-unknown-unknown --bin client   # Web 构建
-dx build --release --platform web --bin client --features bundle   # Dioxus 打包（必须指明 bin=client）
-cargo run --bin client             # 桌面客户端（native）
-dx bundle --release --platform desktop --bin client --features bundle  # 桌面安装包
+# 前端（必须带 --features client）
+cargo check --target wasm32-unknown-unknown --bin client --features client   # wasm 类型检查
+cargo build --target wasm32-unknown-unknown --bin client --features client   # Web 构建
+dx build --release --platform web --bin client --features bundle,client   # Dioxus 打包（必须指明 bin=client）
+cargo run --bin client --features client             # 桌面客户端（native）
+dx bundle --release --platform desktop --bin client --features bundle,client  # 桌面安装包
 
 # 安装 dioxus-cli（指定版本）
 cargo install dioxus-cli --version 0.7.10
@@ -310,9 +313,9 @@ cargo install dioxus-cli --version 0.7.10
 - 推送 `main` 分支 → `.github/workflows/release.yml` 自动构建：
   计算端与桌面客户端（Windows x64 / Linux x64 / **macOS arm64**，Intel macOS 已停发）、Web 版（wasm）；
   桌面客户端为最小化包（`Dioxus.toml` 的 `webview_install_mode = "Skip"` 表示不自带 WebView2）
-- Linux 作业必须先装 GTK/WebKit 开发库并断言 `pkg-config --modversion glib-2.0 / webkit2gtk-4.1`：
-  server 与 client 共享同一个 lib（含 `ui` 模块），编译 lib 时会一并编译 dioxus-desktop，
-  缺库会报 `glib-sys` 的 pkg-config 错误
+- Linux **客户端**作业需装 GTK/WebKit/xdo 开发库并断言 `pkg-config --modversion glib-2.0 / webkit2gtk-4.1 / libxdo`；
+  缺 `libxdo-dev` 会在链接期报 `rust-lld: unable to find library -lxdo`（`muda`/`wry` 依赖）
+- Linux **server** 作业无需任何 GUI 库：server 不启用 `client` 特性，依赖图中不含 dioxus/GTK/WebKit
 - 工作流使用 Node 24 版 action（`checkout@v7` / `cache@v6` / `upload-artifact@v7` / `download-artifact@v8`），
   避免 Node 20 弃用告警
 - `meta` 作业从 `account/Cargo.toml` 读取 `version` 作为 **tag（不带 v 前缀）**；
