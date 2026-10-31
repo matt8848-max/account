@@ -69,24 +69,8 @@ jobs:
         with:
           targets: ${{ matrix.arch }}
 
-      # server 与 client 共享同一个 lib（含 UI 模块），Cargo 编译 lib 时会一并
-      # 编译 dioxus-desktop → glib-sys 等，因此 Linux 上编译 server 同样需要 GTK/WebKit 开发库。
-      - name: 安装 Linux 构建依赖（GLib / GTK / WebKitGTK）
-        if: runner.os == 'Linux'
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config \
-            libglib2.0-dev \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
-            libsoup-3.0-dev \
-            libjavascriptcoregtk-4.1-dev
-          # 早失败：确认 glib / webkit 的 pkg-config 描述文件已就位
-          pkg-config --modversion glib-2.0
-          pkg-config --modversion webkit2gtk-4.1
-
+      # server 不启用 client 特性 → 依赖图里没有 dioxus/GTK/WebKit，
+      # 因此 Linux 上无需安装任何 GUI 开发库
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: account
@@ -134,7 +118,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       # 使用系统自带 WebView（macOS WKWebView / Linux WebKitGTK），不打包浏览器内核。
-      - name: 安装 Linux 构建依赖（GLib / GTK / WebKitGTK）
+      # libxdo-dev 提供 -lxdo（muda/wry 在 Linux 上链接需要），缺它会报 "unable to find library -lxdo"。
+      - name: 安装 Linux 构建依赖（GLib / GTK / WebKitGTK / libxdo）
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
@@ -147,11 +132,13 @@ jobs:
             libsoup-3.0-dev \
             libjavascriptcoregtk-4.1-dev \
             libayatana-appindicator3-dev \
+            libxdo-dev \
             librsvg2-dev \
             patchelf
-          # 早失败：确认 glib / webkit 的 pkg-config 描述文件已就位
+          # 早失败：确认 GUI 依赖已就位（glib/webkit 用 pkg-config，xdo 用运行时库检查）
           pkg-config --modversion glib-2.0
           pkg-config --modversion webkit2gtk-4.1
+          ldconfig -p | grep -q 'libxdo\.so'
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -172,12 +159,12 @@ jobs:
       # Windows 不内嵌 WebView2 运行时，Linux/macOS 使用系统 WebView。
       - name: 构建桌面客户端（裸二进制）
         working-directory: account
-        run: cargo build --release --bin client
+        run: cargo build --release --bin client --features client
 
       - name: 生成安装包 / .app（打包器失败不影响发布，仍会附带裸二进制）
         working-directory: account
         continue-on-error: true
-        run: dx bundle --release --platform desktop --bin client --features bundle --package-types ${{ matrix.package_type }}
+        run: dx bundle --release --platform desktop --bin client --features bundle,client --package-types ${{ matrix.package_type }}
 
       - name: 归档客户端产物
         shell: bash
@@ -236,7 +223,7 @@ jobs:
 
       - name: 构建 Web 客户端
         working-directory: account
-        run: dx build --release --platform web --bin client --features bundle
+        run: dx build --release --platform web --bin client --features bundle,client
 
       - name: 归档 Web 静态站点
         shell: bash
