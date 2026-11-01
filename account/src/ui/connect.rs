@@ -14,6 +14,10 @@ pub(crate) fn ConnectPage() -> Element {
     let base_text = (st.base)();
     let connected = (st.connected)();
     let return_visible = connected;
+    // 页面内提示：连接状态文字 + Toast（替代浏览器原生 alert）
+    let status_text = (st.status_msg)();
+    let status_color = if connected { "#2e7d32" } else { "#c0392b" };
+    let toast_msg = (st.toast)();
     // 确认关闭服务器弹窗开关
     let mut pending_close = use_signal(|| false);
     // 关闭请求进行中，避免重复提交
@@ -95,6 +99,15 @@ pub(crate) fn ConnectPage() -> Element {
                     }
                 },
                 "⛔ 关闭服务器"
+            }
+
+            // 连接页没有底部状态栏，提示直接显示在页面内
+            // （原 Web 端用浏览器原生 alert，会弹出「URL says …」，已移除）
+            if !status_text.is_empty() {
+                p { style: "color:{status_color};font-size:13px;margin:0", "{status_text}" }
+            }
+            if let Some(msg) = &toast_msg {
+                p { style: "color:#c0392b;font-size:13px;margin:0", "{msg}" }
             }
 
             // 关闭确认弹窗

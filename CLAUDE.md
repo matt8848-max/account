@@ -28,7 +28,7 @@
 记账软件/
 ├── CLAUDE.md
 ├── README.md            ← 软件说明（功能、支持平台、安装与使用）
-├── 更新日志.md          ← CHANGELOG（0.3.0 → 0.4.0）
+├── 更新日志.md          ← CHANGELOG（0.3.0 → 0.4.1）
 ├── LICENSE              ← MIT
 ├── .github/workflows/
 │   └── release.yml      ← push main 自动构建 + 以 Cargo 版本为 tag 创建 Release
@@ -44,14 +44,15 @@
         ├── api.rs       ← HTTP API 实现（PUT=读，POST=其余所有 + close + CORS）
         ├── db.rs        ← 数据库连接、迁移（DB_VERSION=2）、总表/货币/对象操作
         ├── db/month.rs  ← 月表操作（组/记录 CRUD、group_months、月度统计）
-        └── ui.rs        ← 客户端 UI 公共父模块（全局状态、HTTP 封装、Toast、确认弹窗、主布局）
+        └── ui.rs        ← 客户端 UI 公共父模块（全局状态、HTTP 封装、提示、确认弹窗、主布局）
         └── ui/
             ├── connect.rs  ← 连接页（含「关闭服务器」按钮）
             ├── records.rs  ← 交易记录浏览器（删除记录/组有确认弹窗；进入页面自动刷新）
             ├── master.rs   ← 交易对象/货币管理（删除有确认弹窗）
             ├── stats.rs    ← 数据统计（含「📤 导出交易记录」入口）
-            ├── export.rs   ← 导出保存对话框（Web 浏览器下载 / 桌面 rfd 另存为）
-            └── update.rs   ← 启动时检测 GitHub 新版本（仅一次）
+            ├── export.rs   ← 导出（保存目标选择 + 后台导出任务 + 进度）
+            ├── status_bar.rs ← 底部状态栏（后端状态 / 更新检测 / 提示 / 进度）
+            └── update.rs   ← 更新检测（启动一次 + 状态栏手动重试）
 ```
 
 **依赖 target 分离**：
@@ -64,8 +65,8 @@
 ## 架构与数据流
 
 - 客户端启动 → 连接页输入后端地址 → `live` 探测连通 → 进入主界面
-- 主界面每 5 分钟自动通过 `live` 接口探测存活；状态栏显示上次探测时间与结果
-- 界面提示统一走 Toast 浮层（`push_toast`）：Web 端额外弹 `window.alert`，桌面端在 UI 内展示——两端均可见
+- 主界面每 5 分钟自动通过 `live` 接口探测存活；**底部状态栏**只显示存活/失联（有颜色），点击展开详情浮层（地址、版本、上次探测时间、立即重测、查看连接页）
+- 界面提示统一写入 `GlobalState.toast`，在主界面**底部状态栏**右侧单行展示（连接页则显示在页面内），3 秒后自动消失；**不再调用浏览器原生 `alert`**（避免「URL says …」这类原生弹窗）
 - 连接页提供「关闭服务器」按钮：未连接时灰色禁用；连接后红色可点，点击后弹确认框，调用 `POST /api/close` 优雅关闭后端
 - **防呆设计**：删除记录/删除组/删除货币/删除交易对象/关闭服务器，均先弹确认框并列出将删除的内容（`ConfirmDialog`），确认后才执行
 - 前端启动时拉取全部交易对象与货币存入内存缓存；增删成功后才更新缓存
@@ -85,13 +86,20 @@
 - **全局 CSS 重置**：根组件 `App` 通过 `style` 元素注入 `GLOBAL_CSS`（连接页与主布局两个分支均注入），清除浏览器默认的 `html, body` 8px `margin`，并统一 `box-sizing: border-box`，避免错误的高度占用导致页面四周空白与多余滚动条
 - 最外层容器用 `height:100dvh; overflow:hidden`，内容区由 `main` 自行滚动，避免桌面/网页出现多余滚动条
 - **导出 xlsx（数据统计页）**：点「📤 导出交易记录」→ `ConfirmDialog` 展示范围（对象 + 月份区间）→
-  确认后按对象逐个 `PUT /api/records`（`from`=起始月 1 号 0 点、`to`=结束月最后一天 23:59:59、`counterparty_id`）→
-  `export::build_xlsx` 生成字节 → 保存对话框（Web 走 `Blob`+`<a download>`；桌面走 `rfd` 另存为 + `std::fs::write`）
-- **导出格式**：每对象一个 sheet；第 1 行交易对象/时间区间/流水总额（转入、转出、净额）；第 2 行表头（`autofilter` 默认开启、冻结前两行）；
-  第 3 行起明细按 `traded_at` 升序；「金额」列为公式 `=H{r}/I{r}`（原始金额分子/分母）并写入缓存值
-- **启动更新检测**：根组件 `App` 挂载时（`use_effect`，仅一次）请求
+  `ExportSaveDialog` 收集保存目标（Web 只填文件名；桌面用 `rfd::AsyncFileDialog` 选路径）→
+  `export::spawn_export` 后台执行：按对象逐个 `PUT /api/records`（`from`=起始月 1 号 0 点、`to`=结束月最后一天 23:59:59、`counterparty_id`）→
+  `export::build_xlsx` 生成字节 → 写盘（Web 走 `Blob`+`<a download>`）。**进度写入 `GlobalState.task`，由底部状态栏显示进度条**
+- **导出不阻塞 UI**：xlsx 生成与写盘走 `run_blocking`（native = `tokio::task::spawn_blocking`）；
+  桌面「另存为」用异步对话框 + `picking` 标记防重入（旧的同步阻塞对话框在 UI 事件回调里调用会卡死/闪退）
+- **导出格式**：每对象一个 sheet；**第 1 行 A~I 合并为一个单元格**，用一行文本显示交易对象/时间区间/流水总额（转入、转出、净额，金额后带货币类型）；
+  第 2 行表头（`autofilter` 默认开启、冻结前两行）；第 3 行起明细按 `traded_at` 升序；「金额」列为公式 `=H{r}/I{r}`（原始金额分子/分母）并写入缓存值
+- **导出排版**：全部单元格水平居中；列宽自动计算（`export::column_widths`，按「表头 + 数据实际显示文本」的显示列数 × 8px + 16px，
+  钳制 64~400px）。日期列按格式化后的 `yyyy-mm-dd hh:mm:ss`（19 列）计算、金额列按带千位分隔符的文本计算，
+  避免 Excel 因列宽不足显示 `####`；合并的首行标题**不参与**列宽计算（否则会撑爆 A 列）
+- **启动更新检测**：根组件 `App` 用 `use_hook`（只执行一次，切页不会重试）请求
   `https://api.github.com/repos/{owner}/{repo}/releases/latest`，`owner/repo` 由 `env!("CARGO_PKG_REPOSITORY")` 解析；
-  版本比较为逐段数字比较（`ui/update.rs::is_newer`），失败/无 release 静默跳过
+  结果写入 `GlobalState.update_state`（`UpdateState`：`Idle/Checking/Available/Latest/Failed`），
+  版本比较为逐段数字比较（`ui/update.rs::is_newer`）。有新版→红色可点打开发布页；已最新→绿色；失败→灰色，后两者点击重新检测
 
 ## 数据库设计
 
@@ -257,16 +265,21 @@ SQLite 单文件数据库，按月分表。核心规则：
 - `ui/records.rs`：交易记录浏览器（挂载时自动刷新；行格式：时间 转出→转入 金额 货币 备注 删除条目按钮 组名 删除组按钮；新建组行的转出/转入、顶部「对象」筛选均用 `SearchSelect` 搜索选择）
 - `ui/master.rs`：交易对象/货币管理（货币、交易对象均有搜索栏，空搜索显示全部；灰白相间列表——交易对象为「名称左 / 金额右 / 货币类型右」，货币名称居中）
 - `ui/stats.rs`：数据统计（双栏交易对象选择：左可搜索列表点「添加」自动去重、右已选列表可「踢出」；结果卡片显示当前余额与逐月收入/支出/前端计算的结算余额；顶部提供「📤 导出交易记录」）
-- `ui/export.rs`：导出保存对话框（`ExportSaveDialog` + `PendingExport`；`sheet_from_views` 把记录视图转成导出表；Web 用 `Blob`+`<a download>` 下载，桌面用 `rfd::FileDialog` 选目录并 `std::fs::write`）
-- `ui/update.rs`：启动时更新检测（`spawn_check`/`repo_slug`/`parse_release`/`is_newer`）
+- `ui/export.rs`：导出（`ExportJob`/`ExportTarget` + `ExportSaveDialog` + `spawn_export`；`sheet_from_views` 把记录视图转成导出表；Web 用 `Blob`+`<a download>`，桌面用 `rfd::AsyncFileDialog` 选路径后 `std::fs::write`，均走 `run_blocking` 后台执行）
+- `ui/status_bar.rs`：底部状态栏（后端连接状态 + 详情浮层 / 更新检测按钮 / 提示信息 / 任务进度条）
+- `ui/update.rs`：更新检测（`spawn_check`/`resolve_state`/`UpdateState`/`repo_slug`/`parse_release`/`is_newer`）
 
 **平台差异条件编译**（`#[cfg(target_arch = "wasm32")]`）：
 - HTTP：wasm 用 gloo-net、native 用 reqwest（跳过自签名证书验证）
 - 定时：wasm 用 gloo-timers、native 用 tokio
 - 时间/时区：wasm 用 JS Date、native 用 chrono::Local
-- 提示：Web 端额外 `window.alert`，桌面端走 UI 内 Toast 浮层
+- 提示：两端都走自建 UI（底栏 / 连接页内），**不使用 `window.alert`**
+- 打开外部链接：wasm `window.open(url, "_blank")`、native `cmd /C start`（Windows，`CREATE_NO_WINDOW`）/ `open`（macOS）/ `xdg-open`（Linux），仅允许 `https://`
+- 后台阻塞任务：native `tokio::task::spawn_blocking`、wasm 直接同步执行（`run_blocking`）
 
-**界面提示**：统一用 `push_toast`（Toast 浮层，两端可见）；Web 端额外弹原生 alert。
+**界面提示**：统一用 `push_toast`（写入 `GlobalState.toast`）；主界面显示在底部状态栏，连接页显示在页面内。
+
+**长任务进度**：`GlobalState.task: Option<TaskProgress>`（`label`/`done`/`total`），底部状态栏显示「任务名 3/5」+ 细进度条；`None` 表示空闲（导出按钮据此禁用）。
 
 **确认弹窗**：删除记录/组/货币/交易对象、关闭服务器均使用 `ConfirmDialog`，弹窗中列出将删除的内容。
 
@@ -291,7 +304,7 @@ cargo run --bin server -- --ip 127.0.0.1        # 指定监听 IP
 cargo run --bin server -- --db data/custom.db   # 指定数据库路径
 cargo run --bin server -- --help                # 查看帮助
 
-cargo test --features client         # 运行单元测试（69 个，含 UI/导出/更新检测/时区）
+cargo test --features client         # 运行单元测试（81 个，含 UI/导出/更新检测/时区）
 cargo clippy --all-targets --features client  # 静态检查
 
 # 打开调试日志（PowerShell：$env:RUST_LOG="debug"; cargo run --bin server）

@@ -25,13 +25,17 @@ pub mod export;
 pub mod master;
 pub mod records;
 pub mod stats;
+pub mod status_bar;
 pub mod update;
+
+use update::UpdateState;
 
 // 让父模块（ui.rs）中的页面切换能直接引用子模块组件
 pub(crate) use connect::ConnectPage;
 pub(crate) use master::MasterPage;
 pub(crate) use records::RecordsPage;
 pub(crate) use stats::StatsPage;
+pub(crate) use status_bar::StatusBar;
 
 pub(crate) const DEFAULT_BASE: &str = "https://127.0.0.2:3000";
 pub(crate) const LIVE_INTERVAL_MS: u64 = 300_000; // 5 分钟
@@ -132,12 +136,60 @@ pub(crate) struct GlobalState {
     pub stats_from: Signal<String>,
     pub stats_to: Signal<String>,
     pub stats_cp: Signal<Vec<i64>>,
-    /// 轻提示（Toast）内容
+    /// 轻提示（Toast）内容：在主界面底部状态栏 / 连接页内展示
     pub toast: Signal<Option<String>>,
-    /// 启动时检测到的新版本提示（None 表示已是最新 / 未检测到 / 该功能未启用）
-    pub update_hint: Signal<Option<String>>,
-    /// 新版本发布页地址（供用户手动访问，None 表示无）
-    pub release_url: Signal<Option<String>>,
+    /// 更新检测状态（底部状态栏展示文案、颜色与点击行为）
+    pub update_state: Signal<UpdateState>,
+    /// 长任务进度（导出等），None 表示当前没有进行中的任务
+    pub task: Signal<Option<TaskProgress>>,
+}
+
+/// 长任务进度（底部状态栏据此显示进度条）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskProgress {
+    /// 任务名称（如「导出交易记录」）
+    pub label: String,
+    /// 已完成步数
+    pub done: usize,
+    /// 总步数（0 表示进度未知，只显示任务名）
+    pub total: usize,
+}
+
+impl TaskProgress {
+    /// 新建进度（从 0 步开始）
+    pub fn new(label: impl Into<String>, total: usize) -> Self {
+        Self {
+            label: label.into(),
+            done: 0,
+            total,
+        }
+    }
+
+    /// 完成一步（不超过总步数）
+    pub fn advance(&mut self) {
+        if self.done < self.total {
+            self.done += 1;
+        }
+    }
+
+    /// 百分比（0~100）；总步数为 0（进度未知）时返回 0
+    pub fn percent(&self) -> u8 {
+        if self.total == 0 {
+            return 0;
+        }
+        let done = self.done.min(self.total);
+        ((done * 100) / self.total) as u8
+    }
+
+    /// 底栏文案：有总步数时形如「导出交易记录 3/5」
+    pub fn describe(&self) -> String {
+        if self.total == 0 {
+            self.label.clone()
+        } else {
+            let done = self.done.min(self.total);
+            format!("{} {}/{}", self.label, done, self.total)
+        }
+    }
 }
 
 /// 新建组草稿行（表单编辑用）
@@ -706,10 +758,10 @@ pub(crate) fn now_str() -> String {
     }
 }
 
-/// 界面提示：桌面端与 Web 端都能看到。
+/// 界面提示：统一走自建 UI（主界面底部状态栏 / 连接页内提示），3 秒后自动消失。
 ///
-/// - Web 端：额外调用浏览器原生 alert（与原行为一致）
-/// - 桌面端：通过 Toast 浮层展示（原生对话框需额外依赖，统一走 UI 内提示）
+/// 不再调用浏览器原生 `alert`：原生弹窗会阻塞页面、弹出「URL says …」这类
+/// 与软件无关的标题，且与自建提示重复（见任务清单「web 的 UI 问题」）。
 pub(crate) fn push_toast(st: &GlobalState, msg: &str) {
     let mut st = *st; // GlobalState 是 Copy，解引用复制一份供闭包移动
     st.toast.set(Some(msg.to_string()));
@@ -717,10 +769,93 @@ pub(crate) fn push_toast(st: &GlobalState, msg: &str) {
         sleep_ms(3000).await;
         st.toast.set(None);
     });
-    #[cfg(target_arch = "wasm32")]
-    {
-        web_sys::window().map(|w| w.alert_with_message(msg).ok());
+}
+
+// ---------- 外部链接 ----------
+
+/// 是否允许打开的外部链接：仅 `https://`，且不含空白（发布页地址来自 GitHub API，
+/// 这里做白名单校验，避免把任意字符串交给系统命令行执行）。
+pub(crate) fn is_safe_external_url(url: &str) -> bool {
+    let url = url.trim();
+    url.len() > "https://".len()
+        && url.starts_with("https://")
+        && !url.contains(char::is_whitespace)
+}
+
+/// 打开外部页面：桌面用系统默认浏览器，Web 开新标签页。
+pub(crate) fn open_external(url: &str) -> Result<(), String> {
+    open_external_impl(url)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn open_external_impl(url: &str) -> Result<(), String> {
+    if !is_safe_external_url(url) {
+        return Err("链接不合法，仅支持 https".to_string());
     }
+    let window = web_sys::window().ok_or_else(|| "无法访问页面窗口".to_string())?;
+    window
+        .open_with_url_and_target(url, "_blank")
+        .map_err(|e| format!("打开链接失败: {e:?}"))?
+        .ok_or_else(|| "浏览器拦截了新窗口，请允许弹出窗口".to_string())?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn open_external_impl(url: &str) -> Result<(), String> {
+    if !is_safe_external_url(url) {
+        return Err("链接不合法，仅支持 https".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    let spawned = {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW：避免打开浏览器时闪出一个黑色控制台窗口
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+    };
+    #[cfg(target_os = "macos")]
+    let spawned = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let spawned = std::process::Command::new("xdg-open").arg(url).spawn();
+    spawned
+        .map(|_| ())
+        .map_err(|e| format!("打开浏览器失败: {e}"))
+}
+
+// ---------- 后台阻塞任务 ----------
+
+/// 在阻塞线程池执行 CPU / IO 密集任务（xlsx 生成、写文件），避免卡住 UI 线程。
+///
+/// - native：`tokio::task::spawn_blocking`（Dioxus 桌面端是多线程 tokio 运行时）
+/// - wasm：浏览器只有单线程，直接同步执行
+pub(crate) async fn run_blocking<F, T>(task: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    run_blocking_impl(task).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_blocking_impl<F, T>(task: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(task)
+        .await
+        .map_err(|e| format!("后台任务失败: {e}"))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn run_blocking_impl<F, T>(task: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    Ok(task())
 }
 
 // ---------- 通用确认弹窗 ----------
@@ -807,14 +942,15 @@ pub fn App() -> Element {
         stats_to: use_signal(String::new),
         stats_cp: use_signal(Vec::new),
         toast: use_signal(|| None),
-        update_hint: use_signal(|| None),
-        release_url: use_signal(|| None),
+        update_state: use_signal(|| UpdateState::Idle),
+        task: use_signal(|| None),
     };
     use_context_provider(move || state);
 
     let st = use_context::<GlobalState>();
-    // 启动时检测一次 GitHub 是否发布了新版本（只提示，不阻塞任何流程）
-    use_effect(move || update::spawn_check(st));
+    // 启动时检测一次 GitHub 是否发布了新版本；use_hook 只在 App 挂载时执行一次，
+    // 之后无论怎么切换页面/重渲染都不会自动重试（重试只能由状态栏点击触发）
+    use_hook(move || update::spawn_check(st));
     // 显示连接页的情形：尚未连接，或用户主动从主界面切回连接页（保持 connected 不变）
     if (st.show_connect)() || !(st.connected)() {
         rsx! {
@@ -845,72 +981,38 @@ fn MainLayout() -> Element {
         });
     });
 
-    let live_ok_flag = (st.live_ok)();
-    let live_text = if live_ok_flag {
-        "● 存活"
-    } else {
-        "○ 离线"
-    };
-    let live_color = if live_ok_flag { "green" } else { "red" };
-    let live_at_text = (st.live_at)();
-    let api_version_text = (st.api_version)();
-    let toast_msg = (st.toast)();
-    // 启动时检测到的新版本提示（None 表示已最新/未检测到），由根组件一次性写入
-    let update_hint_text = (st.update_hint)();
-    let release_page_text = (st.release_url)().unwrap_or_default();
-    let has_release_page = !release_page_text.is_empty();
-
     rsx! {
         div {
             // 使用 100dvh 避免桌面端/网页端出现多余滚动条；
-            // 最外层禁止滚动，内容区由 main 自行滚动
-            style: "display:flex;height:100dvh;margin:0;overflow:hidden",
-            aside { style: "width:200px;border-right:1px solid #ddd;padding:10px;display:flex;flex-direction:column;flex-shrink:0",
-                h2 { "记账软件" }
-                div { style: "font-size:12px;color:#888;margin-bottom:8px", "版本 {api_version_text}" }
-                // 有新版本时给出提示与发布页地址（不自动跳转，避免桌面端 webview 被导航走）
-                if let Some(hint) = &update_hint_text {
-                    div { style: "font-size:12px;color:#c0392b;margin-bottom:8px",
-                        "{hint}"
-                        if has_release_page {
-                            div { style: "color:#7f8c8d;word-break:break-all", "{release_page_text}" }
-                        }
+            // 最外层纵向布局：内容行（侧栏 + main）占满剩余高度，底部状态栏固定高度
+            style: "display:flex;flex-direction:column;height:100dvh;margin:0;overflow:hidden",
+            div { style: "display:flex;flex:1;min-height:0;overflow:hidden",
+                aside { style: "width:200px;border-right:1px solid #ddd;padding:10px;display:flex;flex-direction:column;flex-shrink:0",
+                    h2 { "记账软件" }
+                    // 版本（API/DB）不在此显示：底部状态栏的「后端连接详情」里已有，避免重复
+                    nav { style: "display:flex;flex-direction:column;gap:8px",
+                        button { onclick: move |_| st.page.set(Page::Records), "📒 交易记录" }
+                        button { onclick: move |_| st.page.set(Page::Master), "🏦 对象/货币" }
+                        button { onclick: move |_| st.page.set(Page::Stats), "📊 数据统计" }
                     }
                 }
-                nav { style: "display:flex;flex-direction:column;gap:8px",
-                    button { onclick: move |_| st.page.set(Page::Records), "📒 交易记录" }
-                    button { onclick: move |_| st.page.set(Page::Master), "🏦 对象/货币" }
-                    button { onclick: move |_| st.page.set(Page::Stats), "📊 数据统计" }
-                }
-                div { style: "margin-top:auto;border-top:1px solid #ddd;padding-top:8px",
-                    button {
-                        style: "color:{live_color}",
-                        // 仅切回连接页视图，不断开与服务器的连接
-                        onclick: move |_| st.show_connect.set(true),
-                        "状态: {live_text} (上次 {live_at_text})"
+                main { style: "flex:1;padding:16px;overflow:auto;min-width:0",
+                    match (st.page)() {
+                        Page::Records => rsx! { RecordsPage {} },
+                        Page::Master => rsx! { MasterPage {} },
+                        Page::Stats => rsx! { StatsPage {} },
                     }
                 }
             }
-            main { style: "flex:1;padding:16px;overflow:auto;min-width:0",
-                match (st.page)() {
-                    Page::Records => rsx! { RecordsPage {} },
-                    Page::Master => rsx! { MasterPage {} },
-                    Page::Stats => rsx! { StatsPage {} },
-                }
-            }
-            if let Some(msg) = &toast_msg {
-                div {
-                    style: "position:fixed;top:16px;left:50%;transform:translateX(-50%);background:#333;color:#fff;padding:10px 18px;border-radius:6px;z-index:2000;box-shadow:0 2px 8px rgba(0,0,0,0.3)",
-                    "{msg}"
-                }
-            }
+            // 底部状态栏：后端连接状态 / 更新检测 / 提示信息与任务进度
+            StatusBar {}
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_candidates, selected_label_of};
+    use super::{TaskProgress, filter_candidates, is_safe_external_url, selected_label_of};
 
     /// 候选项集合（含「全部」项，值 0）
     fn candidates() -> Vec<(i64, String)> {
@@ -962,5 +1064,42 @@ mod tests {
         let all = candidates();
         assert!(filter_candidates(&all, "不存在的对象").is_empty());
         assert!(filter_candidates(&[], "支付宝").is_empty());
+    }
+
+    /// 验证任务进度：百分比按步数计算，总数未知时为 0，步数不会超过总数
+    #[test]
+    fn task_progress_should_report_percent_and_steps() {
+        let mut task = TaskProgress::new("导出交易记录", 4);
+        assert_eq!(task.percent(), 0);
+        assert_eq!(task.describe(), "导出交易记录 0/4");
+        task.advance();
+        task.advance();
+        assert_eq!(task.percent(), 50);
+        assert_eq!(task.describe(), "导出交易记录 2/4");
+        // 超额推进不会让百分比超过 100
+        for _ in 0..10 {
+            task.advance();
+        }
+        assert_eq!(task.percent(), 100);
+        assert_eq!(task.describe(), "导出交易记录 4/4");
+
+        // 总步数为 0（进度未知）：只显示任务名，不出现 NaN/除零
+        let unknown = TaskProgress::new("生成文件", 0);
+        assert_eq!(unknown.percent(), 0);
+        assert_eq!(unknown.describe(), "生成文件");
+    }
+
+    /// 验证外部链接白名单：仅接受非空 https 地址，拒绝 http/javascript/带空白等可疑输入
+    #[test]
+    fn external_url_should_only_allow_https() {
+        assert!(is_safe_external_url(
+            "https://github.com/a/b/releases/tag/0.5.0"
+        ));
+        assert!(is_safe_external_url("  https://example.com/x  "));
+        assert!(!is_safe_external_url(""));
+        assert!(!is_safe_external_url("https://"));
+        assert!(!is_safe_external_url("http://example.com"));
+        assert!(!is_safe_external_url("javascript:alert(1)"));
+        assert!(!is_safe_external_url("https://example.com/a b"));
     }
 }
