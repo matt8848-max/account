@@ -1,23 +1,55 @@
-//! 导出落盘（保存对话框 + 平台差异）
+//! 导出：保存目标选择 + 后台导出任务
 //!
-//! xlsx 的生成在 `crate::export`（平台无关），本模块只负责「已有字节 → 用户指定位置」：
-//! - wasm（Web）：只填文件名，通过浏览器下载（`Blob` + `<a download>`）
-//! - native（桌面）：选择保存路径与文件名后写文件（rfd 原生「另存为」对话框）
+//! xlsx 的生成在 `crate::export`（平台无关），本模块负责：
+//! - **选择保存目标**：wasm 只填文件名（浏览器下载）；native 用「另存为」对话框选路径
+//! - **后台执行**：逐个对象拉记录 → 生成 xlsx → 写盘/下载，进度写入 `GlobalState.task`，
+//!   由底部状态栏展示
 //!
-//! 平台差异用 `#[cfg(target_arch = "wasm32")]` 封装成两个内部组件，外层对话框不感知差异。
+//! 性能与稳定性说明（见任务清单「导出交易记录闪退」）：
+//! - 桌面端使用 `rfd::AsyncFileDialog`（内部在工作线程弹窗），不再在 UI 事件回调里
+//!   调用阻塞版 `FileDialog::save_file()`——那会卡住 webview 事件循环，快速连点还会重入；
+//! - xlsx 生成与写盘走 `run_blocking`（native 为 `tokio::task::spawn_blocking`），
+//!   大文件也不会冻结界面。
 
-use super::{GlobalState, RecordView, push_toast};
-use crate::export::{Direction, ExportRecord, ExportSheet, ensure_xlsx_suffix};
-use crate::models::Counterparty;
+use super::{GlobalState, RecordView, TaskProgress, http_put, push_toast, run_blocking};
+use crate::export::{
+    Direction, ExportRecord, ExportSheet, build_xlsx, default_file_name, ensure_xlsx_suffix,
+    month_bounds,
+};
+use crate::models::{Counterparty, Currency};
 use dioxus::prelude::*;
 
-/// 待保存的导出结果（生成好字节后交给保存对话框）
+/// 导出任务参数（范围确认后由统计页构造）
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PendingExport {
-    /// xlsx 文件字节
-    pub bytes: Vec<u8>,
-    /// 默认文件名（含 `.xlsx`）
-    pub default_name: String,
+pub(crate) struct ExportJob {
+    /// 全部交易对象（用于解析名称与货币）
+    pub counterparties: Vec<Counterparty>,
+    /// 全部货币（用于解析货币名称）
+    pub currencies: Vec<Currency>,
+    /// 选中的交易对象 ID（顺序即导出顺序）
+    pub ids: Vec<i64>,
+    /// 起始月份 `YYYY-MM`；None 表示不限
+    pub from: Option<String>,
+    /// 结束月份 `YYYY-MM`；None 表示不限
+    pub to: Option<String>,
+}
+
+impl ExportJob {
+    /// 默认文件名（`account_export_2026-01_2026-03.xlsx`）
+    pub fn default_name(&self) -> String {
+        default_file_name(self.from.as_deref(), self.to.as_deref())
+    }
+}
+
+/// 保存目标：每个平台只有一种形态
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExportTarget {
+    /// 桌面：用户选择的完整路径
+    #[cfg(not(target_arch = "wasm32"))]
+    Path(String),
+    /// Web：交给浏览器的下载文件名
+    #[cfg(target_arch = "wasm32")]
+    FileName(String),
 }
 
 /// 由某交易对象的记录视图构建导出表。
@@ -63,21 +95,22 @@ pub(crate) fn sheet_from_views(
     }
 }
 
-/// 导出保存对话框：确认文件名（桌面端还要确认路径）后写盘或下载。
+/// 导出保存对话框：确认文件名（桌面端还确认保存位置）后回调 `on_confirm`。
 ///
-/// - `pending`：已生成的 xlsx 字节与默认文件名
-/// - `on_done`：保存成功回调，参数为最终文件名或完整路径（用于提示）
+/// - `default_name`：默认文件名（含 `.xlsx`）
+/// - `on_confirm`：用户确认保存目标（桌面为完整路径，Web 为下载文件名）
 /// - `on_cancel`：取消回调
+///
+/// 对话框本身不生成/写文件：真正的导出在 `spawn_export` 里异步执行，避免阻塞 UI。
 #[component]
 pub(crate) fn ExportSaveDialog(
-    pending: PendingExport,
-    on_done: EventHandler<String>,
+    default_name: String,
+    on_confirm: EventHandler<ExportTarget>,
     on_cancel: EventHandler<()>,
 ) -> Element {
-    let mut file_name = use_signal(|| pending.default_name.clone());
+    let mut file_name = use_signal(|| default_name.clone());
     let name_value = (file_name)();
-    let bytes = pending.bytes.clone();
-    let fallback = pending.default_name.clone();
+    let fallback = default_name.clone();
 
     // 平台差异：Web 只有「下载」，桌面还有「选择保存位置」
     #[cfg(target_arch = "wasm32")]
@@ -85,8 +118,7 @@ pub(crate) fn ExportSaveDialog(
         WebSaveControls {
             file_name: name_value.clone(),
             fallback: fallback.clone(),
-            bytes: bytes.clone(),
-            on_saved: move |name: String| on_done.call(name),
+            on_confirm: move |target: ExportTarget| on_confirm.call(target),
         }
     };
     #[cfg(not(target_arch = "wasm32"))]
@@ -94,8 +126,7 @@ pub(crate) fn ExportSaveDialog(
         NativeSaveControls {
             file_name: name_value.clone(),
             fallback: fallback.clone(),
-            bytes: bytes.clone(),
-            on_saved: move |path: String| on_done.call(path),
+            on_confirm: move |target: ExportTarget| on_confirm.call(target),
         }
     };
 
@@ -104,8 +135,8 @@ pub(crate) fn ExportSaveDialog(
             style: "position:fixed;inset:0;background:rgba(0,0,0,0.35);display:flex;align-items:center;justify-content:center;z-index:1600",
             div {
                 style: "background:#fff;border-radius:8px;padding:18px;min-width:360px;max-width:92vw;display:flex;flex-direction:column;gap:10px;box-shadow:0 4px 16px rgba(0,0,0,0.25)",
-                h3 { style: "margin:0", "保存导出文件" }
-                p { style: "margin:0;font-size:12px;color:#666", "格式 .xlsx，每个交易对象一个 sheet（含自动筛选）。" }
+                h3 { style: "margin:0", "导出交易记录" }
+                p { style: "margin:0;font-size:12px;color:#666", "格式 .xlsx，每个交易对象一个 sheet（含自动筛选）。导出在后台进行，进度显示在底部状态栏。" }
                 label { "文件名" }
                 input {
                     value: "{name_value}",
@@ -121,48 +152,41 @@ pub(crate) fn ExportSaveDialog(
     }
 }
 
-/// Web：只填文件名，点击后由浏览器下载
+/// Web：只填文件名，确认后由浏览器下载
 #[cfg(target_arch = "wasm32")]
 #[component]
 fn WebSaveControls(
     file_name: String,
     fallback: String,
-    bytes: Vec<u8>,
-    on_saved: EventHandler<String>,
+    on_confirm: EventHandler<ExportTarget>,
 ) -> Element {
-    let st = use_context::<GlobalState>();
-
     rsx! {
         div { style: "display:flex;gap:8px;align-items:center",
             button {
                 onclick: move |_| {
                     let name = ensure_xlsx_suffix(&file_name, &fallback);
-                    match save_bytes_wasm(&bytes, &name) {
-                        Ok(()) => on_saved.call(name),
-                        Err(e) => push_toast(&st, &e),
-                    }
+                    on_confirm.call(ExportTarget::FileName(name));
                 },
-                "⬇ 下载"
+                "⬇ 导出"
             }
             span { style: "font-size:12px;color:#888", "（浏览器下载目录由浏览器设置决定）" }
         }
     }
 }
-
-/// 桌面：先选目录（可重复选择），再按当前文件名写出
+/// 桌面：选择保存位置（异步对话框，不阻塞 UI），确认后回传完整路径
 #[cfg(not(target_arch = "wasm32"))]
 #[component]
 fn NativeSaveControls(
     file_name: String,
     fallback: String,
-    bytes: Vec<u8>,
-    on_saved: EventHandler<String>,
+    on_confirm: EventHandler<ExportTarget>,
 ) -> Element {
-    let st = use_context::<GlobalState>();
-    // 已选择的目录（空 = 尚未选择，保存时再弹「另存为」）
-    let mut chosen_dir = use_signal(String::new);
+    // 已选择的目录（空 = 尚未选择，导出时再弹「另存为」）
+    let chosen_dir = use_signal(String::new);
+    // 对话框打开中：防止连点重入（旧实现里同步阻塞对话框被反复调用会卡死/闪退）
+    let picking = use_signal(|| false);
     let dir_value = (chosen_dir)();
-    let has_dir = !dir_value.is_empty();
+    let picking_now = (picking)();
     // 两个按钮各自捕获一份副本（String 非 Copy，move 闭包会各取一次）
     let pick_name = file_name.clone();
     let pick_fallback = fallback.clone();
@@ -170,51 +194,73 @@ fn NativeSaveControls(
     rsx! {
         div { style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap",
             button {
+                disabled: picking_now,
                 onclick: move |_| {
-                    let name = ensure_xlsx_suffix(&pick_name, &pick_fallback);
-                    if let Some(path) = pick_save_path(&name) {
-                        // 只记目录：用户随后修改文件名也能生效
-                        let dir = path
-                            .parent()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_default();
-                        chosen_dir.set(dir);
+                    if (picking)() {
+                        return;
                     }
+                    let mut picking = picking;
+                    let mut chosen_dir = chosen_dir;
+                    let name = ensure_xlsx_suffix(&pick_name, &pick_fallback);
+                    picking.set(true);
+                    spawn(async move {
+                        // 只记目录：用户随后修改文件名也能生效
+                        if let Some(path) = pick_save_path(&name).await {
+                            let dir = path
+                                .parent()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default();
+                            chosen_dir.set(dir);
+                        }
+                        picking.set(false);
+                    });
                 },
                 "📁 选择保存位置…"
             }
-            if has_dir {
+            if !dir_value.is_empty() {
                 span { style: "font-size:12px;color:#666;word-break:break-all", "{dir_value}" }
             }
         }
         button {
+            disabled: picking_now,
             onclick: move |_| {
-                let name = ensure_xlsx_suffix(&file_name, &fallback);
-                let target = match (chosen_dir)() {
-                    dir if !dir.is_empty() => std::path::Path::new(&dir).join(&name),
-                    // 未选目录时弹「另存为」；用户取消则中止保存
-                    _ => match pick_save_path(&name) {
-                        Some(path) => path,
-                        None => return,
-                    },
-                };
-                match std::fs::write(&target, &bytes) {
-                    Ok(()) => on_saved.call(target.display().to_string()),
-                    Err(e) => push_toast(&st, &format!("写入文件失败: {e}")),
+                if (picking)() {
+                    return;
                 }
+                let mut picking = picking;
+                let name = ensure_xlsx_suffix(&file_name, &fallback);
+                let dir = (chosen_dir)();
+                picking.set(true);
+                spawn(async move {
+                    let target = if dir.is_empty() {
+                        // 未选目录时弹「另存为」；用户取消则中止导出
+                        pick_save_path(&name).await
+                    } else {
+                        Some(std::path::Path::new(&dir).join(&name))
+                    };
+                    picking.set(false);
+                    if let Some(path) = target {
+                        on_confirm.call(ExportTarget::Path(path.display().to_string()));
+                    }
+                });
             },
-            "💾 保存"
+            "💾 导出"
         }
     }
 }
 
-/// 弹出原生「另存为」对话框，返回用户选择的完整路径（取消返回 None）。
+/// 异步弹出「另存为」对话框，返回用户选择的完整路径（取消返回 None）。
+///
+/// 用 `AsyncFileDialog` 而不是阻塞版 `FileDialog`：rfd 会把对话框放到工作线程，
+/// 不占用 webview 事件循环，配合调用方的 `picking` 标记杜绝重入。
 #[cfg(not(target_arch = "wasm32"))]
-fn pick_save_path(default_name: &str) -> Option<std::path::PathBuf> {
-    rfd::FileDialog::new()
+async fn pick_save_path(default_name: &str) -> Option<std::path::PathBuf> {
+    rfd::AsyncFileDialog::new()
         .set_file_name(default_name)
         .add_filter("Excel 工作簿", &["xlsx"])
         .save_file()
+        .await
+        .map(|handle| handle.path().to_path_buf())
 }
 
 /// 浏览器下载：字节 → Blob → `<a download>` 点击 → 释放对象 URL。
@@ -244,6 +290,122 @@ fn save_bytes_wasm(bytes: &[u8], file_name: &str) -> Result<(), String> {
     // 点击后浏览器已接管下载，立即释放对象 URL 避免内存泄漏
     web_sys::Url::revoke_object_url(&url).map_err(|e| format!("释放下载链接失败: {e:?}"))?;
     Ok(())
+}
+
+// ---------- 后台导出任务 ----------
+
+/// 进度加一步（总步数不变）
+fn advance(st: &mut GlobalState) {
+    if let Some(mut task) = (st.task)() {
+        task.advance();
+        st.task.set(Some(task));
+    }
+}
+
+/// 启动后台导出：进度写入 `GlobalState.task`（底部状态栏展示），结束后自动清空。
+///
+/// 已有任务在跑时直接返回（导出按钮已按 `task` 禁用，这里再兜一层防重入）。
+pub(crate) fn spawn_export(mut st: GlobalState, job: ExportJob, target: ExportTarget) {
+    if (st.task)().is_some() {
+        return;
+    }
+    // 总步数 = 每个对象拉取一次 + 生成一次 + 写入一次
+    let total = job.ids.len() + 2;
+    st.task.set(Some(TaskProgress::new("导出交易记录", total)));
+    spawn(async move {
+        let result = run_export(&mut st, &job, &target).await;
+        st.task.set(None);
+        match result {
+            Ok(msg) => push_toast(&st, &msg),
+            Err(e) => push_toast(&st, &format!("导出失败: {e}")),
+        }
+    });
+}
+
+/// 执行导出：拉记录 → 生成 xlsx → 写盘/下载；成功返回提示文案。
+///
+/// 逐对象拉取是网络 IO（await 不阻塞 UI），xlsx 生成与写盘是 CPU/磁盘密集操作，
+/// 统一走 `run_blocking`，因此大数据量也不会冻结界面。
+async fn run_export(
+    st: &mut GlobalState,
+    job: &ExportJob,
+    target: &ExportTarget,
+) -> Result<String, String> {
+    // 月份区间 → 接口时间边界（起始月 1 号 0 点 / 结束月最后一天 23:59:59）
+    let (from_bound, to_bound) = month_bounds(job.from.as_deref(), job.to.as_deref());
+    let base = (st.base)();
+    let mut sheets: Vec<ExportSheet> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+
+    for id in &job.ids {
+        let Some(cp) = job.counterparties.iter().find(|c| c.id == *id) else {
+            advance(st);
+            continue;
+        };
+        let currency = job
+            .currencies
+            .iter()
+            .find(|c| c.id == cp.currency_id)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        let body = serde_json::json!({
+            "from": from_bound.clone(),
+            "to": to_bound.clone(),
+            "counterparty_id": id,
+        });
+        // 后端 /api/records 按 counterparty_id 过滤（from 或 to 命中）
+        let views: Vec<RecordView> = http_put(&base, "/api/records", Some(body))
+            .await
+            .map(|v| serde_json::from_value(v).unwrap_or_default())
+            .map_err(|e| format!("拉取 {} 记录失败: {e}", cp.name))?;
+        let sheet = sheet_from_views(cp, &currency, job.from.clone(), job.to.clone(), &views);
+        if sheet.records.is_empty() {
+            skipped.push(cp.name.clone());
+        } else {
+            sheets.push(sheet);
+        }
+        advance(st);
+    }
+
+    if sheets.is_empty() {
+        return Err("所选对象在该时间区间内没有交易记录".to_string());
+    }
+
+    // 生成 xlsx：CPU 密集，放阻塞线程池执行
+    let generate = sheets.clone();
+    let bytes = run_blocking(move || build_xlsx(&generate))
+        .await
+        .map_err(|e| format!("生成 xlsx 失败: {e}"))??;
+    advance(st);
+
+    // 写到用户指定位置 / 交给浏览器下载
+    let saved = match target {
+        #[cfg(not(target_arch = "wasm32"))]
+        ExportTarget::Path(path) => {
+            let target_path = path.clone();
+            let data = bytes;
+            run_blocking(move || std::fs::write(&target_path, &data))
+                .await
+                .map_err(|e| format!("写入文件失败: {e}"))?
+                .map_err(|e| format!("写入文件失败: {e}"))?;
+            path.clone()
+        }
+        #[cfg(target_arch = "wasm32")]
+        ExportTarget::FileName(name) => {
+            save_bytes_wasm(&bytes, name)?;
+            name.clone()
+        }
+    };
+    advance(st);
+
+    let mut msg = format!("导出完成: {saved}");
+    if !skipped.is_empty() {
+        msg = format!(
+            "导出完成: {saved}（区间内无记录已跳过：{}）",
+            skipped.join("、")
+        );
+    }
+    Ok(msg)
 }
 
 #[cfg(test)]

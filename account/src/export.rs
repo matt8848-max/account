@@ -5,9 +5,13 @@
 //! - wasm（Web）拿到字节后交给浏览器下载（见 `ui::export`）
 //!
 //! 每个交易对象一个 sheet：
-//! - 第 1 行：交易对象、时间区间、流水总额（转入合计 / 转出合计 / 净额）
+//! - 第 1 行：A~I 合并为一个单元格，用一行文本显示交易对象、时间区间与流水总额
+//!   （转入合计 / 转出合计 / 净额）
 //! - 第 2 行：表头，自动筛选默认开启（冻结前两行）
 //! - 第 3 行起：流水明细，按交易日期升序；日期写成 Excel 日期时间，可直接排序
+//!
+//! 全部单元格水平居中；列宽按「表头 + 数据实际显示文本」自动计算（像素），
+//! 避免 Excel 因列宽不足把日期/金额显示成 `####`。
 //!
 //! B 列「金额」由 H/I 两列原始金额（分子 / 分母）自动计算，并写入缓存值，
 //! 保证不支持公式重算的阅读器也能看到数值。
@@ -30,8 +34,16 @@ const HEADERS: [&str; 9] = [
     "原始金额分母",
 ];
 
-/// 列宽（字符数），与 [`HEADERS`] 一一对应
-const COLUMN_WIDTHS: [f64; 9] = [10.0, 14.0, 10.0, 22.0, 20.0, 30.0, 18.0, 16.0, 16.0];
+/// 每个显示字符估算的像素宽度（略大于 Excel 默认字体的 7px，为替代字体留余量）
+const PX_PER_COL: u32 = 8;
+/// 单元格左右内边距（像素）：保证内容不贴边
+const CELL_PADDING_PX: u32 = 16;
+/// 列宽下限（像素）：避免表头文字被压扁
+const COLUMN_MIN_PX: u32 = 64;
+/// 列宽上限（像素）：避免超长备注把表格撑爆
+const COLUMN_MAX_PX: u32 = 400;
+/// 日期时间格式化后的显示列数（`yyyy-mm-dd hh:mm:ss`，共 19 个半角字符）
+const DATETIME_DISPLAY_COLS: usize = 19;
 
 /// 金额列索引（0 起，B 列）：由原始金额分子/分母计算
 const COL_AMOUNT: u16 = 1;
@@ -198,6 +210,60 @@ pub fn default_file_name(from: Option<&str>, to: Option<&str>) -> String {
     )
 }
 
+/// 金额在表格中的显示文本：与数字格式 `#,##0.######` 一致（整数部分加千位分隔符）。
+///
+/// 用于计算列宽：`1234567.89` 实际显示为 `1,234,567.89`，按后者算宽度才不会偏窄。
+pub fn amount_display(amount: &Money) -> String {
+    let text = amount.to_decimal_string();
+    let (sign, rest) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text.as_str()),
+    };
+    let (int_part, frac_part) = match rest.split_once('.') {
+        Some((int_part, frac)) => (int_part, Some(frac)),
+        None => (rest, None),
+    };
+    let digits: Vec<char> = int_part.chars().collect();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (idx, ch) in digits.iter().enumerate() {
+        // 从右往左每 3 位插一个逗号（最高位前不加）
+        if idx > 0 && (digits.len() - idx).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(*ch);
+    }
+    match frac_part {
+        Some(frac) => format!("{sign}{grouped}.{frac}"),
+        None => format!("{sign}{grouped}"),
+    }
+}
+
+/// 金额 + 货币的显示文本（货币为空时只显示金额，避免多余空格）。
+fn amount_with_currency(amount: &Money, currency: &str) -> String {
+    let currency = currency.trim();
+    if currency.is_empty() {
+        amount_display(amount)
+    } else {
+        format!("{} {}", amount_display(amount), currency)
+    }
+}
+
+/// 第 1 行合并单元格的标题文本：所有信息用一行文本展示（不含换行）。
+///
+/// 流水总额的三项金额后面都带上货币类型（如 `1,234.56 RMB`），
+/// 避免只看首行时无法判断金额币种。
+pub fn title_line(sheet: &ExportSheet, totals: &ExportTotals) -> String {
+    format!(
+        "交易对象: {}（{}） | 时间区间: {} | 流水总额-转入: {} | 流水总额-转出: {} | 流水总额-净额: {}",
+        sheet.counterparty,
+        sheet.currency,
+        range_label(sheet.month_from.as_deref(), sheet.month_to.as_deref()),
+        amount_with_currency(&totals.income, &sheet.currency),
+        amount_with_currency(&totals.expense, &sheet.currency),
+        amount_with_currency(&totals.net, &sheet.currency),
+    )
+}
+
 /// 规范化用户填写的文件名：去掉首尾空白，为空时回退默认名，缺 `.xlsx` 后缀时补齐。
 ///
 /// 只补后缀不做路径处理：路径分隔符由各自的保存流程（桌面选路径 / 浏览器下载）负责。
@@ -279,6 +345,72 @@ fn column_letter(col: u16) -> char {
     (b'A' + (col.min(25) as u8)) as char
 }
 
+/// 是否为全角/中日韩字符（在 Excel 中约占 2 个半角字符的宽度）。
+fn is_wide_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x1100..=0x115F     // 谚文字母
+        | 0x2E80..=0xA4CF   // 康熙部首、CJK、假名、注音、谚文兼容等
+        | 0xAC00..=0xD7A3   // 谚文音节
+        | 0xF900..=0xFAFF   // CJK 兼容汉字
+        | 0xFE30..=0xFE6F   // CJK 兼容形式
+        | 0xFF00..=0xFF60   // 全角 ASCII
+        | 0xFFE0..=0xFFE6   // 全角符号
+        | 0x20000..=0x3FFFD // CJK 扩展 B 及以后
+    )
+}
+
+/// 单行文本的显示宽度：半角字符计 1，全角/中日韩字符计 2。
+pub fn display_cols(text: &str) -> usize {
+    text.chars()
+        .map(|c| if is_wide_char(c) { 2 } else { 1 })
+        .sum()
+}
+
+/// 显示列数 → 列宽（像素）：按每列 [`PX_PER_COL`] 估算并加内边距，钳制在上下限之间。
+fn column_width_px(cols: usize) -> u32 {
+    let px = (cols as u32).saturating_mul(PX_PER_COL) + CELL_PADDING_PX;
+    px.clamp(COLUMN_MIN_PX, COLUMN_MAX_PX)
+}
+
+/// 计算 9 列的建议列宽（像素）：取「表头 + 所有数据行实际显示文本」的最大显示宽度。
+///
+/// - 日期列按格式化后的 `yyyy-mm-dd hh:mm:ss` 计（解析失败时按写入的原始文本），
+///   避免出现「列宽按原始字符串算够、实际显示却不够」的 `####` 问题；
+/// - 金额列按带千位分隔符的显示文本计；
+/// - 合并的第 1 行标题不参与计算，否则会把 A 列撑到极宽。
+pub fn column_widths(rows: &[&ExportRecord], headers: &[&str; 9]) -> [u32; 9] {
+    let mut max_cols: [usize; 9] = [0; 9];
+    for (idx, header) in headers.iter().enumerate() {
+        max_cols[idx] = display_cols(header);
+    }
+    for rec in rows {
+        let amount = amount_display(&rec.amount);
+        // 能解析成 Excel 日期时间时，单元格显示的是固定格式文本（19 列）
+        let traded_at_cols = match excel_datetime(&rec.traded_at) {
+            Some(_) => DATETIME_DISPLAY_COLS,
+            None => display_cols(&rec.traded_at),
+        };
+        let values = [
+            display_cols(rec.direction.label()),
+            display_cols(&amount),
+            display_cols(&rec.currency),
+            display_cols(&rec.other_party),
+            traded_at_cols,
+            display_cols(rec.remark.as_deref().unwrap_or("")),
+            display_cols(rec.group.as_deref().unwrap_or("")),
+            display_cols(&rec.amount.value.to_string()),
+            display_cols(&rec.amount.divisor.to_string()),
+        ];
+        for (idx, cols) in values.iter().enumerate() {
+            if *cols > max_cols[idx] {
+                max_cols[idx] = *cols;
+            }
+        }
+    }
+    max_cols.map(column_width_px)
+}
+
 /// 统一把 `XlsxError` 转成给用户看的错误文本
 fn xlsx_err(err: XlsxError) -> String {
     format!("生成 xlsx 失败: {err}")
@@ -292,15 +424,23 @@ pub fn build_xlsx(sheets: &[ExportSheet]) -> Result<Vec<u8>, String> {
         return Err("没有可导出的数据".to_string());
     }
 
-    let title_fmt = Format::new().set_bold();
+    let title_fmt = Format::new().set_bold().set_align(FormatAlign::Center);
     let header_fmt = Format::new()
         .set_bold()
         .set_align(FormatAlign::Center)
         .set_border(FormatBorder::Thin)
         .set_background_color("#D9E1F2");
-    let amount_fmt = Format::new().set_num_format("#,##0.######");
-    let int_fmt = Format::new().set_num_format("0");
-    let date_fmt = Format::new().set_num_format(DATE_FORMAT);
+    // 正文统一水平居中（用户要求所有列居中）
+    let body_fmt = Format::new().set_align(FormatAlign::Center);
+    let amount_fmt = Format::new()
+        .set_num_format("#,##0.######")
+        .set_align(FormatAlign::Center);
+    let int_fmt = Format::new()
+        .set_num_format("0")
+        .set_align(FormatAlign::Center);
+    let date_fmt = Format::new()
+        .set_num_format(DATE_FORMAT)
+        .set_align(FormatAlign::Center);
 
     let mut workbook = Workbook::new();
     let mut used_names: Vec<String> = Vec::new();
@@ -315,22 +455,10 @@ pub fn build_xlsx(sheets: &[ExportSheet]) -> Result<Vec<u8>, String> {
         let worksheet = workbook.add_worksheet();
         worksheet.set_name(name).map_err(xlsx_err)?;
 
-        // 第 1 行：交易对象 / 时间区间 / 流水总额（转入、转出、净额）
-        let title_cells = [
-            format!("交易对象: {}（{}）", sheet.counterparty, sheet.currency),
-            format!(
-                "时间区间: {}",
-                range_label(sheet.month_from.as_deref(), sheet.month_to.as_deref())
-            ),
-            format!("流水总额-转入: {}", totals.income.to_decimal_string()),
-            format!("流水总额-转出: {}", totals.expense.to_decimal_string()),
-            format!("流水总额-净额: {}", totals.net.to_decimal_string()),
-        ];
-        for (col, text) in title_cells.iter().enumerate() {
-            worksheet
-                .write_string_with_format(0, col as u16, text.as_str(), &title_fmt)
-                .map_err(xlsx_err)?;
-        }
+        // 第 1 行：A~I 合并为一个单元格，用一行文本展示全部信息
+        worksheet
+            .merge_range(0, 0, 0, 8, &title_line(sheet, &totals), &title_fmt)
+            .map_err(xlsx_err)?;
 
         // 第 2 行：表头（自动筛选的标题行）
         for (col, title) in HEADERS.iter().enumerate() {
@@ -344,7 +472,7 @@ pub fn build_xlsx(sheets: &[ExportSheet]) -> Result<Vec<u8>, String> {
             // 公式用 Excel 行号（1 起）
             let excel_row = row + 1;
             worksheet
-                .write_string(row, 0, rec.direction.label())
+                .write_string_with_format(row, 0, rec.direction.label(), &body_fmt)
                 .map_err(xlsx_err)?;
             // 金额 = 原始金额分子 / 分母；写入缓存值供不重算公式的阅读器显示
             let formula = Formula::new(format!(
@@ -357,10 +485,10 @@ pub fn build_xlsx(sheets: &[ExportSheet]) -> Result<Vec<u8>, String> {
                 .write_formula_with_format(row, COL_AMOUNT, formula, &amount_fmt)
                 .map_err(xlsx_err)?;
             worksheet
-                .write_string(row, 2, rec.currency.as_str())
+                .write_string_with_format(row, 2, rec.currency.as_str(), &body_fmt)
                 .map_err(xlsx_err)?;
             worksheet
-                .write_string(row, 3, rec.other_party.as_str())
+                .write_string_with_format(row, 3, rec.other_party.as_str(), &body_fmt)
                 .map_err(xlsx_err)?;
             match excel_datetime(&rec.traded_at) {
                 Some(datetime) => {
@@ -371,15 +499,15 @@ pub fn build_xlsx(sheets: &[ExportSheet]) -> Result<Vec<u8>, String> {
                 // 时间无法解析时退化为文本，至少不丢数据
                 None => {
                     worksheet
-                        .write_string(row, 4, rec.traded_at.as_str())
+                        .write_string_with_format(row, 4, rec.traded_at.as_str(), &body_fmt)
                         .map_err(xlsx_err)?;
                 }
             }
             worksheet
-                .write_string(row, 5, rec.remark.as_deref().unwrap_or(""))
+                .write_string_with_format(row, 5, rec.remark.as_deref().unwrap_or(""), &body_fmt)
                 .map_err(xlsx_err)?;
             worksheet
-                .write_string(row, 6, rec.group.as_deref().unwrap_or(""))
+                .write_string_with_format(row, 6, rec.group.as_deref().unwrap_or(""), &body_fmt)
                 .map_err(xlsx_err)?;
             worksheet
                 .write_number_with_format(row, COL_NUMERATOR, rec.amount.value as f64, &int_fmt)
@@ -402,9 +530,10 @@ pub fn build_xlsx(sheets: &[ExportSheet]) -> Result<Vec<u8>, String> {
         worksheet
             .set_freeze_panes(DATA_START_ROW, 0)
             .map_err(xlsx_err)?;
-        for (col, width) in COLUMN_WIDTHS.iter().enumerate() {
+        // 列宽按内容自动计算（像素）：日期列按格式化后的文本算，避免显示成 `####`
+        for (col, width) in column_widths(&rows, &HEADERS).iter().enumerate() {
             worksheet
-                .set_column_width(col as u16, *width)
+                .set_column_width_pixels(col as u16, *width)
                 .map_err(xlsx_err)?;
         }
     }
@@ -659,5 +788,124 @@ mod tests {
             ensure_xlsx_suffix("  导出.xlsx  ", "default.xlsx"),
             "导出.xlsx"
         );
+    }
+
+    /// 验证金额显示文本：整数部分按千位加逗号，小数部分原样保留（与 `#,##0.######` 一致）
+    #[test]
+    fn amount_display_should_insert_thousand_separators() {
+        // 1234567.89 → 1,234,567.89
+        assert_eq!(
+            amount_display(&Money {
+                value: 123456789,
+                divisor: 100
+            }),
+            "1,234,567.89"
+        );
+        // 三位以内不加逗号；整数无需补小数点
+        assert_eq!(amount_display(&Money::from_int(999)), "999");
+        assert_eq!(amount_display(&Money::from_int(1000)), "1,000");
+        assert_eq!(amount_display(&Money::from_int(0)), "0");
+        // 负数：负号保留在最前，逗号只加在整数部分
+        assert_eq!(
+            amount_display(&Money {
+                value: -1234567,
+                divisor: 1
+            }),
+            "-1,234,567"
+        );
+    }
+
+    /// 验证显示宽度：中文/全角按 2 列计，ASCII 按 1 列计（空串为 0）
+    #[test]
+    fn display_cols_should_count_wide_chars_as_two() {
+        assert_eq!(display_cols(""), 0);
+        assert_eq!(display_cols("abc"), 3);
+        assert_eq!(display_cols("交易对象"), 8);
+        assert_eq!(display_cols("2026-03-01 12:30:00"), DATETIME_DISPLAY_COLS);
+        // 中英混排：2 个中文（4）+ 3 个 ASCII（3）
+        assert_eq!(display_cols("备注abc"), 7);
+    }
+
+    /// 验证首行标题文本：全部信息拼成一行（不含换行），含对象、货币、区间与三项汇总
+    #[test]
+    fn title_line_should_join_all_info_in_one_line() {
+        let data = sheet(vec![
+            rec(Direction::In, 123456, 100, "2026-01-01 00:00:00"),
+            rec(Direction::Out, 25, 1, "2026-01-02 00:00:00"),
+        ]);
+        let totals = summarize(&data.records);
+        let line = title_line(&data, &totals);
+        assert!(!line.contains('\n'), "标题必须是单行文本");
+        assert!(line.contains("交易对象: 支付宝（RMB）"));
+        assert!(line.contains("时间区间: 2026-01 ~ 2026-03"));
+        // 流水总额三项金额后面都要带货币类型
+        assert!(line.contains("流水总额-转入: 1,234.56 RMB"));
+        assert!(line.contains("流水总额-转出: 25 RMB"));
+        assert!(line.contains("流水总额-净额: 1,209.56 RMB"));
+
+        // 月份区间为「不限」时同样可读
+        let mut open = sheet(vec![]);
+        open.month_from = None;
+        open.month_to = None;
+        let line = title_line(&open, &summarize(&[]));
+        assert!(line.contains("时间区间: 不限"));
+
+        // 货币为空时只显示金额，不追加多余空格
+        let mut no_currency = sheet(vec![]);
+        no_currency.currency = String::new();
+        let line = title_line(&no_currency, &summarize(&[]));
+        assert!(line.contains("流水总额-转入: 0 | 流水总额-转出: 0 |"));
+        assert!(!line.contains("  "), "空货币不应留下双空格");
+        assert!(!line.ends_with(' '), "空货币不应留下尾随空格");
+    }
+
+    /// 验证列宽：无数据行时按表头计算，且不低于下限（表头不被压扁）
+    #[test]
+    fn column_widths_should_use_header_when_no_records() {
+        let widths = column_widths(&[], &HEADERS);
+        for (idx, width) in widths.iter().enumerate() {
+            let expected = (display_cols(HEADERS[idx]) as u32) * PX_PER_COL + CELL_PADDING_PX;
+            assert_eq!(*width, expected.clamp(COLUMN_MIN_PX, COLUMN_MAX_PX));
+        }
+        // 表头「原始金额分子」为 12 个显示列 → 112px
+        assert_eq!(widths[7], 112);
+    }
+
+    /// 验证列宽：日期列按格式化后的 19 列计算，足够显示 `yyyy-mm-dd hh:mm:ss`（回归：曾因 20 字符宽显示 `####`）
+    #[test]
+    fn column_widths_should_leave_room_for_datetime() {
+        let records = [rec(Direction::Out, 1, 1, "2026-03-01 12:30:00")];
+        let rows: Vec<&ExportRecord> = records.iter().collect();
+        let widths = column_widths(&rows, &HEADERS);
+        let expected = DATETIME_DISPLAY_COLS as u32 * PX_PER_COL + CELL_PADDING_PX;
+        assert_eq!(widths[4], expected);
+        assert!(
+            widths[4] >= 160,
+            "日期列过窄会把内容显示成 ####，实际 {}px",
+            widths[4]
+        );
+    }
+
+    /// 验证列宽：金额列按带千位分隔符的显示文本计算，不会被截断
+    #[test]
+    fn column_widths_should_account_for_amount_separators() {
+        let records = [rec(Direction::In, 123456789, 100, "2026-03-01 00:00:00")];
+        let rows: Vec<&ExportRecord> = records.iter().collect();
+        let widths = column_widths(&rows, &HEADERS);
+        // "1,234,567.89" 为 12 个显示列 → 112px
+        assert_eq!(widths[1], 112);
+    }
+
+    /// 验证列宽：超长备注被钳制到上限，避免单列撑爆表格
+    #[test]
+    fn column_widths_should_clamp_long_text() {
+        let mut long = rec(Direction::Out, 1, 1, "not-a-time");
+        long.remark = Some("很长的备注".repeat(100));
+        let records = [long];
+        let rows: Vec<&ExportRecord> = records.iter().collect();
+        let widths = column_widths(&rows, &HEADERS);
+        assert_eq!(widths[5], COLUMN_MAX_PX);
+        // 时间无法解析时退化为文本，按原始字符串长度计（"not-a-time" 为 10 列）
+        assert_eq!(widths[4], 10 * PX_PER_COL + CELL_PADDING_PX);
     }
 }

@@ -10,12 +10,12 @@
 //! 因此查询时 `to` 固定传空，确保拿到所选起始月之后的全部月份；
 //! 展示时再按用户选择的结束月份过滤。
 
-use super::export::{ExportSaveDialog, PendingExport, sheet_from_views};
+use super::export::{ExportJob, ExportSaveDialog, ExportTarget, spawn_export};
 use super::{
-    ConfirmDialog, GlobalState, MonthStatView, ObjectGroupView, ObjectStatView, RecordView,
-    cp_label, http_put, push_toast,
+    ConfirmDialog, GlobalState, MonthStatView, ObjectGroupView, ObjectStatView, cp_label, http_put,
+    push_toast,
 };
-use crate::export::{build_xlsx, default_file_name, month_bounds, range_label};
+use crate::export::range_label;
 use crate::models::{Counterparty, Currency, Money};
 use dioxus::prelude::*;
 
@@ -144,10 +144,11 @@ pub(crate) fn StatsPage() -> Element {
     let stats_to = (st.stats_to)();
     // 左侧交易对象搜索词（空 → 显示全部）
     let mut cp_search = use_signal(String::new);
-    // 导出流程：范围确认弹窗 / 已生成的待保存文件 / 生成中标记
+    // 导出流程：范围确认弹窗 / 待导出的任务参数（Some 时显示保存对话框）
     let mut export_confirm = use_signal(|| false);
-    let mut pending_export = use_signal(|| None::<PendingExport>);
-    let exporting = use_signal(|| false);
+    let pending_job = use_signal(|| None::<ExportJob>);
+    // 有导出任务在跑时禁用按钮（进度显示在底部状态栏）
+    let exporting = (st.task)().is_some();
 
     // 左侧可搜索列表：按「名称 (货币)」子串匹配，忽略大小写
     let q = (cp_search)().trim().to_lowercase();
@@ -354,7 +355,8 @@ pub(crate) fn StatsPage() -> Element {
                         "🔍 查对象统计"
                     }
                     button {
-                        // 第一步：弹确认框展示导出范围；确认后才拉数据并生成文件
+                        // 第一步：弹确认框展示导出范围；确认后选择保存位置并后台导出
+                        disabled: exporting,
                         onclick: move |_| {
                             if (st.stats_cp)().is_empty() {
                                 push_toast(&st, "请至少选择一个交易对象");
@@ -364,8 +366,8 @@ pub(crate) fn StatsPage() -> Element {
                         },
                         "📤 导出交易记录"
                     }
-                    if (exporting)() {
-                        span { style: "font-size:12px;color:#888", "正在生成导出文件…" }
+                    if exporting {
+                        span { style: "font-size:12px;color:#888", "正在导出…（进度见底部状态栏）" }
                     }
                     span { style: "font-size:12px;color:#888", "结算余额按所选月份逐月显示（由当前余额向前倒推）" }
                 }
@@ -408,106 +410,37 @@ pub(crate) fn StatsPage() -> Element {
                 message: export_scope.clone(),
                 on_confirm: move |_| {
                     let st = st;
-                    let mut pending_export = pending_export;
-                    let mut exporting = exporting;
+                    let mut pending_job = pending_job;
                     // 闭包需 FnMut：每次确认都从最新状态取快照
                     let ids = (st.stats_cp)();
-                    let from = export_from.clone();
-                    let to = export_to.clone();
-                    let counterparties = (st.counterparties)().clone();
-                    let currencies = (st.currencies)().clone();
-                    spawn(async move {
-                        if (exporting)() {
-                            return;
-                        }
-                        exporting.set(true);
-                        // 月份区间 → 接口时间边界（起始月 1 号 0 点 / 结束月最后一天 23:59:59）
-                        let (from_bound, to_bound) = month_bounds(from.as_deref(), to.as_deref());
-                        let base = (st.base)();
-                        let mut sheets = Vec::new();
-                        let mut skipped: Vec<String> = Vec::new();
-                        let mut failed: Option<String> = None;
-                        // 逐个对象拉取：后端 /api/records 按 counterparty_id 过滤（from 或 to 命中）
-                        for id in ids {
-                            let Some(cp) = counterparties.iter().find(|c| c.id == id) else {
-                                continue;
-                            };
-                            let currency = currencies
-                                .iter()
-                                .find(|c| c.id == cp.currency_id)
-                                .map(|c| c.name.clone())
-                                .unwrap_or_default();
-                            let body = serde_json::json!({
-                                "from": from_bound.clone(),
-                                "to": to_bound.clone(),
-                                "counterparty_id": id,
-                            });
-                            match http_put(&base, "/api/records", Some(body)).await {
-                                Ok(v) => {
-                                    let views: Vec<RecordView> =
-                                        serde_json::from_value(v).unwrap_or_default();
-                                    let sheet = sheet_from_views(
-                                        cp,
-                                        &currency,
-                                        from.clone(),
-                                        to.clone(),
-                                        &views,
-                                    );
-                                    if sheet.records.is_empty() {
-                                        skipped.push(cp.name.clone());
-                                    } else {
-                                        sheets.push(sheet);
-                                    }
-                                }
-                                Err(e) => {
-                                    failed = Some(format!("拉取 {} 记录失败: {e}", cp.name));
-                                    break;
-                                }
-                            }
-                        }
-                        exporting.set(false);
-                        if let Some(msg) = failed {
-                            push_toast(&st, &msg);
-                            return;
-                        }
-                        if sheets.is_empty() {
-                            push_toast(&st, "所选对象在该时间区间内没有交易记录");
-                            return;
-                        }
-                        match build_xlsx(&sheets) {
-                            Ok(bytes) => {
-                                pending_export.set(Some(PendingExport {
-                                    bytes,
-                                    default_name: default_file_name(from.as_deref(), to.as_deref()),
-                                }));
-                                if skipped.is_empty() {
-                                    push_toast(&st, "导出文件已生成，请确认保存位置");
-                                } else {
-                                    push_toast(
-                                        &st,
-                                        &format!(
-                                            "已生成 {} 个 sheet；区间内无记录已跳过：{}",
-                                            sheets.len(),
-                                            skipped.join("、")
-                                        ),
-                                    );
-                                }
-                            }
-                            Err(e) => push_toast(&st, &e),
-                        }
-                    });
+                    if ids.is_empty() {
+                        push_toast(&st, "请至少选择一个交易对象");
+                        return;
+                    }
+                    pending_job.set(Some(ExportJob {
+                        counterparties: (st.counterparties)(),
+                        currencies: (st.currencies)(),
+                        ids,
+                        from: export_from.clone(),
+                        to: export_to.clone(),
+                    }));
                 }
             }
 
-            // 第二步：选择保存位置并写出文件（Web 走浏览器下载）
-            if let Some(pending) = (pending_export)() {
+            // 第二步：选择保存位置（Web 只填文件名），确认后由后台任务导出
+            if let Some(job) = (pending_job)() {
                 ExportSaveDialog {
-                    pending: pending.clone(),
-                    on_done: move |saved: String| {
-                        pending_export.set(None);
-                        push_toast(&st, &format!("导出成功: {saved}"));
+                    default_name: job.default_name(),
+                    on_confirm: move |target: ExportTarget| {
+                        let mut pending_job = pending_job;
+                        let job = job.clone();
+                        pending_job.set(None);
+                        spawn_export(st, job, target);
                     },
-                    on_cancel: move |_| pending_export.set(None),
+                    on_cancel: move |_| {
+                        let mut pending_job = pending_job;
+                        pending_job.set(None);
+                    },
                 }
             }
         }
