@@ -3,6 +3,7 @@
 //! 一行固定高度承载三类信息（取代原顶部黑色 Toast 浮层）：
 //! - **后端连接状态**：只显示「存活 / 失联」（有颜色），点击在上方展开详情浮层；
 //!   浮层用绝对定位，**不改变底栏高度**，因此不会挤动页面内容。
+//!   关闭方式：再点一次状态按钮，或点击浮层之外的任意位置（透明遮罩层）。
 //! - **更新检测**：有新版（红，点击打开发布页）/ 已最新（绿，点击重测）/ 失败（灰，点击重测）
 //! - **提示信息 + 长任务进度**：提示来自 `push_toast`，进度来自 `GlobalState.task`
 //!
@@ -68,6 +69,16 @@ pub(crate) fn StatusBar() -> Element {
 
             // 详情浮层：绝对定位于底栏上方，不占用布局高度
             if detail_open {
+                // 点击面板之外的任意位置即关闭：铺满视口的透明遮罩，
+                // 层高低于浮层（1400 < 1500），因此点浮层内部不会触发关闭
+                div {
+                    style: "position:fixed;inset:0;z-index:1400;background:transparent",
+                    onclick: move |_| {
+                        // 与上方按钮的写法保持一致：Signal 的 set 需要可变绑定
+                        let mut show_detail = show_detail;
+                        show_detail.set(false);
+                    },
+                }
                 div {
                     style: "position:absolute;left:8px;bottom:100%;margin-bottom:4px;background:#fff;border:1px solid #ddd;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,0.15);padding:10px 12px;min-width:300px;z-index:1500;display:flex;flex-direction:column;gap:6px;color:#333",
                     div { style: "font-weight:600", "后端连接详情" }
