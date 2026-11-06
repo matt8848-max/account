@@ -6,7 +6,8 @@
 //! 且**同时支持手动输入**：
 //!
 //! - `DatePicker`：日期。输入框可直接键入 `YYYY-MM-DD`，也可点「📅」展开中文日历选择
-//! - `TimePicker`：时/分，均可**直接键入**数字，也可用 ▲/▼ 微调（24 小时制）
+//! - `TimePicker`：时/分，默认都是 `0`；可直接键入任意文本，**焦点离开时**校验并格式化为
+//!   对应数字（`059` / `59.0` → `59`），非法则格式化为 `0`；也可用 ▲/▼ 微调
 //! - `DayTimeInput`：日期 + 时间组合，值形如 `YYYY-MM-DDTHH:MM`（与原组件接口一致，
 //!   交易记录页 / 新建组表单无需改动即可获得「输入 + 选择」）
 //! - `MonthPicker`：年月选择，值形如 `YYYY-MM`（可手输，或展开自定义面板点选月份；
@@ -98,22 +99,59 @@ pub(crate) fn format_month(year: i32, month: u32) -> String {
     format!("{year:04}-{month:02}")
 }
 
-/// 把数字文本收敛到 `[min, max]` 并补零到 `width` 位
+/// 解析「整数值」文本：允许前导零与 `.0` 形式的小数，且必须落在 `[min, max]`
 ///
-/// 非数字或空串回退到 `min`：`年` / `时` / `分` 这类字段不允许留空，
-/// 清空后视为下界（0 时 0 分、1900 年），失焦即恢复为合法值。
-pub(crate) fn clamp_number(text: &str, min: u32, max: u32, width: usize) -> String {
-    let digits: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
-    let value = digits.parse::<u32>().unwrap_or(min).clamp(min, max);
-    format!("{value:0width$}", width = width)
+/// - `"059"` → `Some(59)`：按数值解释，前导零没有意义
+/// - `"59.0"` → `Some(59)`：小数部分为 0 视为整数
+/// - `"59.5"`、`"abc"`、空串、负数、越界 → `None`
+pub(crate) fn parse_plain_number(text: &str, min: u32, max: u32) -> Option<u32> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let value = text.parse::<f64>().ok()?;
+    // 必须是非负、有限的「整数数值」："59.0" 合法，而 "59.5" 不能当作时分/月份
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 {
+        return None;
+    }
+    let value = value as u64;
+    if value < min as u64 || value > max as u64 {
+        return None;
+    }
+    Some(value as u32)
 }
 
-/// 在 `[min, max]` 范围内步进（到边界后钳住，不回绕）
-pub(crate) fn step_number(text: &str, min: u32, max: u32, delta: i32, width: usize) -> String {
-    let digits: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
-    let current = digits.parse::<i64>().unwrap_or(min as i64);
-    let next = (current + delta as i64).clamp(min as i64, max as i64) as u32;
-    format!("{next:0width$}", width = width)
+/// 规范化数字文本：合法 → 对应的整数文本（**不带前导零**，如 `"059"` / `"59.0"` → `"59"`）；
+/// 非法或越界 → 下界 `min`
+///
+/// 时分的下界为 0，因此非法输入直接显示 `0`（组件的默认值）。
+pub(crate) fn normalize_number(text: &str, min: u32, max: u32) -> String {
+    parse_plain_number(text, min, max)
+        .unwrap_or(min)
+        .to_string()
+}
+
+/// 在 `[min, max]` 内按 `delta` 步进（到边界后钳住，不回绕）；非法起点按 `min` 计算
+pub(crate) fn step_number(text: &str, min: u32, max: u32, delta: i32) -> String {
+    let current = parse_plain_number(text, min, max).unwrap_or(min) as i64;
+    (current + delta as i64)
+        .clamp(min as i64, max as i64)
+        .to_string()
+}
+
+/// 展示用数字文本：去掉前导零（`"08"` → `"8"`、`"00"` → `"0"`）
+fn visible_number(text: &str) -> String {
+    let trimmed = text.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// 存储用补零：`"8"` → `"08"`（时分需拼成合法 ISO 时间 `HH:MM`）
+fn pad_two(text: &str) -> String {
+    format!("{:0>2}", text.trim())
 }
 
 /// 把 `YYYY-MM-DDTHH:MM` 拆成 `(日期, 时, 分)`，越界值会被收敛到合法范围
@@ -180,8 +218,9 @@ pub(crate) fn DatePicker(value: String, onchange: EventHandler<String>) -> Eleme
         cells.push(None);
     }
 
-    let year_text = format!("{view_year:04}");
-    let month_text = format!("{view_month:02}");
+    // 面板上的年/月显示不带前导零（中文里「2026 年 8 月」更自然）
+    let year_text = view_year.to_string();
+    let month_text = view_month.to_string();
     // 闭包是 FnMut（可多次调用），String 又非 Copy：每个回调各持一份副本
     let value_for_blur = value.clone();
     let value_for_open = value.clone();
@@ -345,13 +384,18 @@ pub(crate) fn DatePicker(value: String, onchange: EventHandler<String>) -> Eleme
 }
 /// 数字输入（可**直接键入** + ▲/▼ 微调）
 ///
-/// - `value`：当前显示值（补零文本，如 `08`、`2026`）
-/// - `min` / `max`：允许范围；手输超界或清空时在**失焦后**收敛到边界
-/// - `width`：补零宽度（2 = 时/分，4 = 年份）
+/// - `value`：当前显示值（**不带前导零**，如 `8`、`59`、`2026`）
+/// - `min` / `max`：合法范围
+/// - `width`：输入框建议宽度（字符数，仅影响样式）
 ///
-/// 输入过程中只过滤非数字字符、**不立刻补零或截断**：
-/// 否则用户输入「15」时会被中间态（「01」补零、或长度截断）打断。
-/// 补零与夹紧统一由失焦时的 `clamp_number` 完成，步进按钮用 `step_number`。
+/// 行为（与用户约定一致）：
+/// - 默认值即下界（时分为 `0`）
+/// - 输入过程中保留用户原文（不实时过滤/补零/截断），只有**焦点离开**时才校验：
+///   合法则格式化为对应数字（`059`、`59.0` → `59`），非法则格式化为下界（时分为 `0`）
+/// - ▲/▼ 在 `[min, max]` 内步进，到边界钳住
+///
+/// 实现说明：本地编辑文本只在**输入框获得焦点期间**生效，失焦后回落到外部 `value`，
+/// 因此父级（面板的上一月/下一年按钮等）改值能立即反映，也不会在渲染期写信号。
 #[component]
 pub(crate) fn NumberField(
     value: String,
@@ -360,42 +404,68 @@ pub(crate) fn NumberField(
     width: usize,
     onchange: EventHandler<String>,
 ) -> Element {
-    // 输入框宽度按数字位数留出余量（ch 单位随字号）
-    let input_width = width.max(1) + 2;
-    // 闭包是 FnMut，String 非 Copy：每个回调各持一份副本
-    let value_for_blur = value.clone();
+    // 编辑期文本（仅在 focused 时用于显示）
+    let mut text = use_signal(|| value.clone());
+    // 是否处于编辑期
+    let mut focused = use_signal(|| false);
+    let shown = if (focused)() { (text)() } else { value.clone() };
     let value_for_up = value.clone();
     let value_for_down = value.clone();
+    let shown_for_focus = shown.clone();
+    let input_width = width.max(1) + 2;
 
     rsx! {
         div { style: "display:inline-flex;align-items:center;gap:2px",
             input {
-                // 触屏设备弹数字键盘
-                inputmode: "numeric",
-                value: "{value}",
+                // 触屏设备弹数字键盘（允许小数点，便于输入 "59.0"）
+                inputmode: "decimal",
+                value: "{shown}",
                 style: "width:{input_width}ch;text-align:center",
-                oninput: move |e| {
-                    let digits: String = e
-                        .value()
-                        .chars()
-                        .filter(|c| c.is_ascii_digit())
-                        .collect();
-                    onchange.call(digits);
+                // 进入编辑期：以当前显示值为起点
+                onfocus: move |_| {
+                    text.set(shown_for_focus.clone());
+                    focused.set(true);
                 },
-                // 失焦收敛：清空回退到下界、超界夹到边界，并补零
-                onblur: move |_| onchange.call(clamp_number(&value_for_blur, min, max, width)),
+                oninput: move |e| text.set(e.value()),
+                // 焦点离开：校验并格式化（合法 → 对应数字；非法 → min，时分为 0），
+                // 同时结束编辑期，显示回落到父级规范化后的值
+                onblur: move |_| {
+                    let normalized = normalize_number(&(text)(), min, max);
+                    text.set(normalized.clone());
+                    focused.set(false);
+                    onchange.call(normalized);
+                },
             }
             div { style: "display:flex;flex-direction:column;gap:1px",
                 button {
                     title: "加一",
                     style: "font-size:8px;line-height:8px;padding:1px 3px;background:#fff;border:1px solid #ccc;border-radius:2px;cursor:pointer",
-                    onclick: move |_| onchange.call(step_number(&value_for_up, min, max, 1, width)),
+                    onclick: move |_| {
+                        // 步进以「当前显示值」为基准：编辑期用输入文本，否则用外部值
+                        let base = if (focused)() {
+                            (text)()
+                        } else {
+                            value_for_up.clone()
+                        };
+                        let next = step_number(&base, min, max, 1);
+                        text.set(next.clone());
+                        onchange.call(next);
+                    },
                     "▲"
                 }
                 button {
                     title: "减一",
                     style: "font-size:8px;line-height:8px;padding:1px 3px;background:#fff;border:1px solid #ccc;border-radius:2px;cursor:pointer",
-                    onclick: move |_| onchange.call(step_number(&value_for_down, min, max, -1, width)),
+                    onclick: move |_| {
+                        let base = if (focused)() {
+                            (text)()
+                        } else {
+                            value_for_down.clone()
+                        };
+                        let next = step_number(&base, min, max, -1);
+                        text.set(next.clone());
+                        onchange.call(next);
+                    },
                     "▼"
                 }
             }
@@ -405,33 +475,40 @@ pub(crate) fn NumberField(
 
 /// 时分输入（24 小时制）
 ///
-/// 时、分都**可直接键入**数字，也可用 ▲/▼ 微调；`time` 约定为 `HH:MM`。
-/// 键入的数字原样回传上游，渲染时再由 `split_datetime` 收敛为两位，
-/// 因此输入「15」不会被中间态打断（先出现「01」再补成「15」也成立）。
+/// 时、分都**可直接键入**数字（也可 ▲/▼ 微调），默认都是 `0`；`time` 约定为 `HH:MM`。
+/// **展示不带前导零**（`8 时 5 分`），而回写上游时补零成合法 ISO 时间（`08:05`），
+/// 因此既能随手输入，也不会破坏后端的 `YYYY-MM-DDTHH:MM` 格式。
 #[component]
 pub(crate) fn TimePicker(time: String, onchange: EventHandler<String>) -> Element {
     // 借用占位日期复用 split_datetime 的收敛逻辑，避免再写一套解析实现
     let (_, hour, minute) = split_datetime(&format!("1970-01-01T{time}"));
-    // 闭包是 FnMut：两个字段各持一份对方取值的副本
-    let minute_for_hour = minute.clone();
-    let hour_for_minute = hour.clone();
+    // 展示：去前导零（"00" → "0"）；存储：补零（"8" → "08"）
+    let hour_text = visible_number(&hour);
+    let minute_text = visible_number(&minute);
+    let minute_for_hour = pad_two(&minute);
+    let hour_for_minute = pad_two(&hour);
 
     rsx! {
         div { style: "display:flex;gap:4px;align-items:center",
             NumberField {
-                value: hour,
+                value: hour_text,
                 min: 0,
                 max: 23,
                 width: 2,
-                onchange: move |h: String| onchange.call(format!("{h}:{minute_for_hour}")),
+                onchange: move |h: String| {
+                    // NumberField 已保证 h 是合法数字文本，这里只负责拼成补零的 HH:MM
+                    onchange.call(format!("{}:{minute_for_hour}", pad_two(&h)));
+                },
             }
             span { "时" }
             NumberField {
-                value: minute,
+                value: minute_text,
                 min: 0,
                 max: 59,
                 width: 2,
-                onchange: move |m: String| onchange.call(format!("{hour_for_minute}:{m}")),
+                onchange: move |m: String| {
+                    onchange.call(format!("{hour_for_minute}:{}", pad_two(&m)));
+                },
             }
             span { "分" }
         }
@@ -503,7 +580,7 @@ pub(crate) fn MonthPicker(
     });
     let selected = parse_month(&value);
     let browse_year = (view_year)();
-    let year_text = format!("{browse_year:04}");
+    let year_text = browse_year.to_string();
     let months: Vec<u32> = (1..=12).collect();
     // 闭包是 FnMut，String 非 Copy：每个回调各持一份副本
     let value_for_blur = value.clone();
@@ -739,39 +816,66 @@ mod tests {
         assert_eq!(parse_month(&format_month(2026, 7)), Some((2026, 7)));
     }
 
-    /// 验证数字收敛：补零、夹到边界、空/非法文本回退到下界、非数字字符被过滤
+    /// 验证「整数值」解析：前导零与 `.0` 视为同一数值；非整数、负数、越界、非数字都非法
     #[test]
-    fn clamp_number_should_pad_and_clamp() {
-        assert_eq!(clamp_number("8", 0, 23, 2), "08");
-        assert_eq!(clamp_number("15", 0, 23, 2), "15");
-        // 超上界夹到 max
-        assert_eq!(clamp_number("99", 0, 23, 2), "23");
-        // 空串 / 非数字回退到下界（时分为 0、年份为 1900）
-        assert_eq!(clamp_number("", 0, 23, 2), "00");
-        assert_eq!(clamp_number("abc", 0, 23, 2), "00");
-        assert_eq!(clamp_number("", 1900, 2100, 4), "1900");
-        // 年份：合法值原样、越界夹紧
-        assert_eq!(clamp_number("2026", 1900, 2100, 4), "2026");
-        assert_eq!(clamp_number("1234", 1900, 2100, 4), "1900");
-        // 混入的非数字字符被过滤（"1a5" → 15）
-        assert_eq!(clamp_number("1a5", 0, 23, 2), "15");
-        // 不相等断言：补零不能改变数值（不能把 8 变成 80）
-        assert_ne!(clamp_number("8", 0, 23, 2), "80");
+    fn parse_plain_number_should_accept_integral_values_only() {
+        // 用户约定的格式化来源：059 → 59、59.0 → 59
+        assert_eq!(parse_plain_number("059", 0, 59), Some(59));
+        assert_eq!(parse_plain_number("59.0", 0, 59), Some(59));
+        assert_eq!(parse_plain_number("0", 0, 23), Some(0));
+        // 前后空白被裁剪
+        assert_eq!(parse_plain_number(" 8 ", 0, 23), Some(8));
+        assert_eq!(parse_plain_number("2026", 1900, 2100), Some(2026));
+
+        // 越界
+        assert_eq!(parse_plain_number("60", 0, 59), None);
+        assert_eq!(parse_plain_number("24", 0, 23), None);
+        assert_eq!(parse_plain_number("1899", 1900, 2100), None);
+        // 非整数 / 负数 / 非数字 / 空串
+        assert_eq!(parse_plain_number("59.5", 0, 59), None);
+        assert_eq!(parse_plain_number("-1", 0, 23), None);
+        assert_eq!(parse_plain_number("abc", 0, 59), None);
+        assert_eq!(parse_plain_number("", 0, 59), None);
+        // 不相等断言：解析结果不能是错位的数值
+        assert_ne!(parse_plain_number("059", 0, 59), Some(95));
     }
 
-    /// 验证步进：正常加减，到边界后钳住而不回绕
+    /// 验证规范化（焦点离开时调用）：合法输入变成对应数字文本，非法输入格式化为下界
+    /// （时分下界为 0，即默认显示 0）
+    #[test]
+    fn normalize_number_should_format_or_fallback_to_min() {
+        // 用户约定：059 → 59、59.0 → 59（且不再带前导零）
+        assert_eq!(normalize_number("059", 0, 59), "59");
+        assert_eq!(normalize_number("59.0", 0, 59), "59");
+        assert_eq!(normalize_number("8", 0, 23), "8");
+        assert_eq!(normalize_number("0", 0, 23), "0");
+        // 非法（非数字 / 越界 / 非整数 / 空串）→ 下界
+        assert_eq!(normalize_number("abc", 0, 59), "0");
+        assert_eq!(normalize_number("60", 0, 59), "0");
+        assert_eq!(normalize_number("59.5", 0, 59), "0");
+        assert_eq!(normalize_number("", 0, 23), "0");
+        // 年份字段的下界是 1900
+        assert_eq!(normalize_number("", 1900, 2100), "1900");
+        // 不相等断言：格式化后不再保留前导零
+        assert_ne!(normalize_number("059", 0, 59), "059");
+    }
+
+    /// 验证步进：正常加减，到边界后钳住而不回绕；非法起点按 min 起算
     #[test]
     fn step_number_should_clamp_at_bounds() {
-        assert_eq!(step_number("08", 0, 23, 1, 2), "09");
-        assert_eq!(step_number("08", 0, 23, -1, 2), "07");
+        assert_eq!(step_number("8", 0, 23, 1), "9");
+        assert_eq!(step_number("8", 0, 23, -1), "7");
         // 上界 +1 保持上界、下界 -1 保持下界（不回绕）
-        assert_eq!(step_number("23", 0, 23, 1, 2), "23");
-        assert_eq!(step_number("00", 0, 23, -1, 2), "00");
-        assert_eq!(step_number("59", 0, 59, 1, 2), "59");
-        assert_eq!(step_number("2026", 1900, 2100, 1, 4), "2027");
-        assert_eq!(step_number("2100", 1900, 2100, 1, 4), "2100");
+        assert_eq!(step_number("23", 0, 23, 1), "23");
+        assert_eq!(step_number("0", 0, 23, -1), "0");
+        assert_eq!(step_number("59", 0, 59, 1), "59");
+        assert_eq!(step_number("2026", 1900, 2100, 1), "2027");
+        assert_eq!(step_number("2100", 1900, 2100, 1), "2100");
+        // 非法起点（如刚清空输入框）按 min 起算
+        assert_eq!(step_number("abc", 0, 59, 1), "1");
+        assert_eq!(step_number("", 1900, 2100, 1), "1901");
         // 不相等断言：正常步进必须真的改变数值
-        assert_ne!(step_number("08", 0, 23, 1, 2), "08");
+        assert_ne!(step_number("8", 0, 23, 1), "8");
     }
 
     /// 验证 datetime 拆分：缺时间/缺日期/越界时间都被收敛为可渲染的默认值

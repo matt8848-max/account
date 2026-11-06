@@ -272,7 +272,7 @@ SQLite 单文件数据库，按月分表。核心规则：
 跨页公用的代码保留在 `ui.rs`（父模块）；**每页 UI 分别存于 `ui/` 子目录**（类似 `db.rs` + `db/month.rs`）：
 
 - `ui.rs`：全局状态（`GlobalState`，含 `records_order` 排序方向）、跨 bin 会话缓存 `session`（`set_active/active_base/clear`，供桌面端退出时关后端）、HTTP 封装（`http_put/http_post` 及绝对 URL 的 `http_get`）、平台差异封装（sleep/now_str/提示）、全局 CSS 重置（`GLOBAL_CSS`，`App` 注入 `style` 元素并注入 `document::Link` 图标）、`SearchSelect`（搜索+候选选择组件：输入框 `value` 只绑定用户输入；**已选项用黑字叠加层展示、占位文本保持灰色**；`Enter` 确认、`Escape`/失焦收起候选、候选用 `mousedown`+`prevent_default` 选择、`empty_label` 插入「全部」项）、`parse_money`、`ConfirmDialog`、`MainLayout`、根 `App`
-- `ui/date.rs`：中文日期组件（`DatePicker` 可手输 `YYYY-MM-DD` + 日历面板、`TimePicker` 时/分可**直接键入**+▲/▼微调、`DayTimeInput` = 日期+时间、`MonthPicker` 可手输 `YYYY-MM` + 自定义年月面板（可「不限」）、`NumberField` 可手输数字输入；纯逻辑 `days_in_month`/`weekday_index_monday`/`shift_month`/`parse_date`/`format_date`/`split_datetime`/`clamp_number`/`step_number` 均有单测）
+- `ui/date.rs`：中文日期组件（`DatePicker` 可手输 `YYYY-MM-DD` + 日历面板、`TimePicker` 时/分默认 `0` 且可任意键入（失焦校验：`059`/`59.0`→`59`，非法→`0`）、`DayTimeInput` = 日期+时间、`MonthPicker` 可手输 `YYYY-MM` + 自定义年月面板（可「不限」）、`NumberField` 可手输数字输入；纯逻辑 `days_in_month`/`weekday_index_monday`/`shift_month`/`parse_date`/`format_date`/`split_datetime`/`parse_plain_number`/`normalize_number`/`step_number` 均有单测）
 - `ui/connect.rs`：连接页（五行布局；连接按钮兼任返回主页面；断开清缓存；关闭服务器走 `ConfirmDialog`）
 - `ui/records.rs`：交易记录浏览器（挂载时自动刷新；**`SortToggle` 切换 `SortOrder`（默认从新到旧）**，`sort_records` 纯函数可单测；行格式：时间 转出→转入 金额 货币 备注 删除条目按钮 组名 删除组按钮；新建组行的转出/转入、顶部「对象」筛选均用 `SearchSelect`）
 - `ui/master.rs`：交易对象/货币管理（货币、交易对象均有搜索栏，空搜索显示全部；灰白相间列表——交易对象为「名称左 / 金额右 / 货币类型右」，货币名称居中）
