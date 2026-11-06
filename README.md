@@ -19,6 +19,8 @@
 | Android / iOS | ❌ **不支持手机端** | ❌ |
 
 > macOS **Intel（x86_64）版本已不再提供**（该类设备已基本淘汰），仅发布 Apple Silicon 版。
+> 发布包中的 macOS 产物由 CI 的 macOS runner 构建：若该 runner 在仓库所在账号下不可用，
+> macOS 作业会被跳过/失败但不影响其它平台发布，此时可用源码在本机执行 `dx bundle` 自行打包。
 
 > 桌面客户端**不自带浏览器内核**（安装包最小化）：Windows 用系统 WebView2、Linux 用 WebKitGTK、macOS 用 WKWebView。
 > 若系统缺少对应 WebView 运行时，请先安装（Windows 10/11 一般已自带 WebView2）。
@@ -162,7 +164,7 @@ uv run tools/make_icons.py 原图.jpg --delete-source   # 生成 assets 后删�
 
 - 推送到 `main` 分支会触发 `.github/workflows/release.yml`
 - 版本号取自 `account/Cargo.toml`，工作流**自动以其作为 tag 创建 Release**（tag 已存在则只构建不发版）
-- 发布产物：计算端（Windows / **Linux 静态 musl 二进制** / macOS arm64）、桌面客户端（Windows / Linux / macOS arm64）、Web 版静态站点
+- 发布产物：计算端（Windows / **Linux 静态 musl 二进制** / macOS arm64 可选）、桌面客户端（Windows / Linux / macOS arm64 可选）、Web 版静态站点
 
 ## 开发与测试
 

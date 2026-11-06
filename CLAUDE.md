@@ -342,8 +342,16 @@ cargo install dioxus-cli --version 0.7.10
 ## 发布流程（CI）
 
 - 推送 `main` 分支 → `.github/workflows/release.yml` 自动构建：
-  计算端与桌面客户端（Windows x64 / Linux x64 / **macOS arm64**，Intel macOS 已停发）、Web 版（wasm）；
+  计算端与桌面客户端（Windows x64 / Linux x64 为**必需作业**；**macOS arm64 为可选作业**）、Web 版（wasm）；
   桌面客户端为最小化包（`Dioxus.toml` 的 `webview_install_mode = "Skip"` 表示不自带 WebView2）
+- **macOS 作业单独拆出**（`server_macos` / `desktop_macos`）并设 `continue-on-error: true`：
+  账号/仓库不支持托管 macOS runner 时（报 `The configuration 'macos-14-arm64-us-default' is not supported`）
+  只会让该作业失败，不会阻断其它作业与发布；runner 恢复后 macOS 产物会自动回到 Release。
+  标签用 `macos-latest`，若解析到的镜像不可用可改用 `macos-15` / `macos-14`
+- 发布作业（`release`）用 `needs: [... server_macos, desktop_macos]` + `if: !cancelled() && 必需作业均 success`：
+  等待可选作业结束以收集其产物，但只有必需作业成功才发版，避免发出残缺 Release
+- **产物上传加 `overwrite: true`**：同一 run 重跑（re-run）时同名 artifact 已存在会返回
+  409 `Failed to CreateArtifact ... artifact with this name already exists`，覆盖即可重跑
 - **Linux 计算端为完全静态二进制**：`x86_64-unknown-linux-musl` + `RUSTFLAGS="-C target-feature=+crt-static"`，
   需 `musl-tools`（bundled SQLite 的 C 代码用 `musl-gcc` 编译）；作业内用 `readelf -d` 断言无 `NEEDED`，
   产物不依赖 glibc 等系统动态库，可在各类 x86_64 发行版直接运行

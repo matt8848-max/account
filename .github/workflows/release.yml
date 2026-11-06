@@ -69,10 +69,8 @@ jobs:
             asset: linux-x64
             arch: x86_64-unknown-linux-musl
             rustflags: "-C target-feature=+crt-static"
-          - os: macos-14
-            asset: macos-arm64
-            arch: aarch64-apple-darwin
-            rustflags: ""
+          # macOS 单独放在 server_macos 作业（见下文）：该作业允许失败，
+          # 避免 runner 不可用时阻断整条发布流程
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
@@ -136,12 +134,50 @@ jobs:
           name: server-${{ matrix.asset }}
           path: dist/*
           if-no-files-found: error
+          # 重跑（re-run）时同名产物已存在，覆盖而非 409 冲突
+          overwrite: true
+
+  # macOS 计算端（可选作业）
+  #
+  # 单独成作业并 `continue-on-error: true`：GitHub 托管的 macOS runner 若不可用
+  # （例如报 "The configuration 'macos-14-arm64-us-default' is not supported"），
+  # 本作业失败但不影响其它作业与发布；runner 恢复后产物会自动回到 Release。
+  # 若 `macos-latest` 解析到的镜像不可用，可换成 `macos-15` / `macos-14` 再试。
+  server_macos:
+    name: 计算端 macos-arm64（可选）
+    needs: meta
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: account
+
+      - name: 构建计算端（release）
+        working-directory: account
+        run: cargo build --release --bin account_server --target aarch64-apple-darwin
+
+      - name: 打包产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          bin="account/target/aarch64-apple-darwin/release/account_server"
+          tar -czf "dist/account_server-macos-arm64.tar.gz" -C "$(dirname "$bin")" "$(basename "$bin")"
+          ls -l dist
 
       - uses: actions/upload-artifact@v7
         with:
-          name: server-${{ matrix.asset }}
+          name: server-macos-arm64
           path: dist/*
           if-no-files-found: error
+          overwrite: true
 
   desktop:
     name: 桌面客户端 ${{ matrix.asset }}
@@ -153,7 +189,7 @@ jobs:
         include:
           - { os: windows-latest, asset: windows-x64, package_type: nsis }
           - { os: ubuntu-latest, asset: linux-x64, package_type: deb }
-          - { os: macos-14, asset: macos-arm64, package_type: macos }
+          # macOS 单独放在 desktop_macos 作业（见下文）：允许失败，不阻断发布
     steps:
       - uses: actions/checkout@v7
 
@@ -219,11 +255,8 @@ jobs:
           else
             cp account/target/release/account_client stage/
           fi
-          # dx 打包产物：安装包（.exe/.msi/.deb）与 macOS .app
+          # dx 打包产物：安装包（Windows .exe/.msi、Linux .deb）
           find account/target/dx -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.deb' \) -exec cp {} stage/ \; 2>/dev/null || true
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            find account/target/dx -maxdepth 7 -type d -name '*.app' -exec cp -R {} stage/ \; 2>/dev/null || true
-          fi
           if [ "${{ runner.os }}" = "Windows" ]; then
             powershell -Command "Compress-Archive -Path 'stage/*' -DestinationPath 'dist/$name.zip' -Force"
           else
@@ -236,6 +269,61 @@ jobs:
           name: client-desktop-${{ matrix.asset }}
           path: dist/*
           if-no-files-found: error
+          # 重跑（re-run）时同名产物已存在，覆盖而非 409 冲突
+          overwrite: true
+
+  # macOS 桌面客户端（可选作业，理由同 server_macos）
+  desktop_macos:
+    name: 桌面客户端 macos-arm64（可选）
+    needs: meta
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: account
+
+      - name: 缓存 dioxus-cli
+        id: dx-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/dx*
+          key: dx-${{ env.DX_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: 安装 dioxus-cli
+        if: steps.dx-cache.outputs.cache-hit != 'true'
+        run: cargo install dioxus-cli --version ${{ env.DX_VERSION }} --locked
+
+      - name: 构建桌面客户端（裸二进制）
+        working-directory: account
+        run: cargo build --release --bin account_client --features client
+
+      - name: 生成 .app（打包器失败不影响发布，仍会附带裸二进制）
+        working-directory: account
+        continue-on-error: true
+        # macOS 的默认打包产物即 .app，故不指定 --package-types
+        run: dx bundle --release --platform desktop --bin account_client --features bundle,client
+
+      - name: 归档客户端产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist stage
+          cp account/target/release/account_client stage/
+          find account/target/dx -maxdepth 7 -type d -name '*.app' -exec cp -R {} stage/ \; 2>/dev/null || true
+          tar -czf "dist/account_client-macos-arm64.tar.gz" -C stage .
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: client-desktop-macos-arm64
+          path: dist/*
+          if-no-files-found: error
+          overwrite: true
 
   wasm:
     name: Web 客户端 wasm
@@ -286,12 +374,15 @@ jobs:
           name: client-web-wasm
           path: dist/*
           if-no-files-found: error
+          overwrite: true
 
   release:
     name: 发布 Release（tag = Cargo 版本号）
-    needs: [meta, server, desktop, wasm]
-    # tag 已存在则跳过，保证 main 上多次提交不会重复发版
-    if: needs.meta.outputs.tag_exists == 'false'
+    # macOS 为可选作业（runner 不可用时失败），这里一并等待其结束，
+    # 但只有必需作业（Windows/Linux 计算端、桌面客户端、Web）成功才发布，
+    # 避免因可选作业失败而跳过发布、或因必需作业失败而发出残缺的发布
+    needs: [meta, server, desktop, wasm, server_macos, desktop_macos]
+    if: ${{ !cancelled() && needs.meta.outputs.tag_exists == 'false' && needs.server.result == 'success' && needs.desktop.result == 'success' && needs.wasm.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
