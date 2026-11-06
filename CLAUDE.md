@@ -76,7 +76,11 @@
   「断开」只断开网络连接（清缓存、保留地址、留在本页）；「关闭服务器」弹确认框后调用 `POST /api/close`
 - 桌面端**关闭窗口（含系统关闭按钮）时联动关闭后端**：`bin/account_client.rs` 用
   `Config::with_custom_event_handler` 捕获 `WindowEvent::CloseRequested`，读取 `ui::session` 中的
-  当前后端地址并 `POST /api/close`（1.5s 超时，失败仅 `warn` 日志），避免留下后台进程
+  当前后端地址并 `POST /api/close`（1.5s 超时，失败仅 `warn` 日志），避免留下后台进程。
+  **注意**：该回调运行在 Dioxus 事件循环线程上，而该线程已在 tokio 运行时内，
+  直接 `block_on` 新运行时会 panic（`Cannot start a runtime from within a runtime`），
+  因此请求放在独立线程的运行时里执行（`run_on_new_thread`：std 通道 + 超时等待），
+  并有 `#[tokio::test]` 回归用例覆盖这一场景
 - **防呆设计**：删除记录/删除组/删除货币/删除交易对象/关闭服务器，均先弹确认框并列出将删除的内容（`ConfirmDialog`），确认后才执行
 - 前端启动时拉取全部交易对象与货币存入内存缓存；增删成功后才更新缓存
 - 所有增删改查均以后端成功响应为准再更新前端显示，未指定处理方式的失败弹 Toast 警告
