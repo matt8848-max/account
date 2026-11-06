@@ -2,16 +2,16 @@
 //!
 //! 浏览器原生 `input type="date" / type="month"` 的显示语言与小时制跟随系统区域设置
 //! （Windows 上常见英文月份名与 12 小时制 AM/PM），与软件其余部分的中文界面不一致。
-//! 这里用「自绘日历面板 + 可手输数字输入（[`NumberField`]）」实现完全中文化的日期选择，
+//! 这里用「自绘日历面板 + 可手输数字输入（`NumberField`）」实现完全中文化的日期选择，
 //! 且**同时支持手动输入**：
 //!
-//! - [`DatePicker`]：日期。输入框可直接键入 `YYYY-MM-DD`，也可点「📅」展开中文日历选择
-//! - [`TimePicker`]：时/分，均可**直接键入**数字，也可用 ▲/▼ 微调（24 小时制）
-//! - [`DayTimeInput`]：日期 + 时间组合，值形如 `YYYY-MM-DDTHH:MM`（与原组件接口一致，
+//! - `DatePicker`：日期。输入框可直接键入 `YYYY-MM-DD`，也可点「📅」展开中文日历选择
+//! - `TimePicker`：时/分，均可**直接键入**数字，也可用 ▲/▼ 微调（24 小时制）
+//! - `DayTimeInput`：日期 + 时间组合，值形如 `YYYY-MM-DDTHH:MM`（与原组件接口一致，
 //!   交易记录页 / 新建组表单无需改动即可获得「输入 + 选择」）
-//! - [`MonthPicker`]：年月选择，值形如 `YYYY-MM`（可手输，或展开自定义面板点选月份；
+//! - `MonthPicker`：年月选择，值形如 `YYYY-MM`（可手输，或展开自定义面板点选月份；
 //!   统计页月份范围还可设为「不限」）
-//! - [`NumberField`]：可手输 + ▲/▼ 微调的数字输入（年/时/分复用同一组件）
+//! - `NumberField`：可手输 + ▲/▼ 微调的数字输入（年/时/分复用同一组件）
 //!
 //! 纯逻辑（天数、星期对齐、格式解析）放在文件顶部，便于单元测试；
 //! 组件只负责渲染与回调，平台无关（桌面 / Web 共用）。
@@ -351,7 +351,7 @@ pub(crate) fn DatePicker(value: String, onchange: EventHandler<String>) -> Eleme
 ///
 /// 输入过程中只过滤非数字字符、**不立刻补零或截断**：
 /// 否则用户输入「15」时会被中间态（「01」补零、或长度截断）打断。
-/// 补零与夹紧统一由失焦时的 [`clamp_number`] 完成，步进按钮用 [`step_number`]。
+/// 补零与夹紧统一由失焦时的 `clamp_number` 完成，步进按钮用 `step_number`。
 #[component]
 pub(crate) fn NumberField(
     value: String,
@@ -406,7 +406,7 @@ pub(crate) fn NumberField(
 /// 时分输入（24 小时制）
 ///
 /// 时、分都**可直接键入**数字，也可用 ▲/▼ 微调；`time` 约定为 `HH:MM`。
-/// 键入的数字原样回传上游，渲染时再由 [`split_datetime`] 收敛为两位，
+/// 键入的数字原样回传上游，渲染时再由 `split_datetime` 收敛为两位，
 /// 因此输入「15」不会被中间态打断（先出现「01」再补成「15」也成立）。
 #[component]
 pub(crate) fn TimePicker(time: String, onchange: EventHandler<String>) -> Element {
@@ -482,8 +482,8 @@ pub(crate) fn DayTimeInput(value: String, onchange: EventHandler<String>) -> Ele
 
 /// 年月选择（`YYYY-MM`）
 ///
-/// 与 [`DatePicker`] 同一套交互：输入框可**直接键入** `YYYY-MM`，
-/// 也可点「📅」展开自定义面板——面板用 [`NumberField`] 选年、月份以 3×4 格子点选，
+/// 与 `DatePicker` 同一套交互：输入框可**直接键入** `YYYY-MM`，
+/// 也可点「📅」展开自定义面板——面板用 `NumberField` 选年、月份以 3×4 格子点选，
 /// 不再依赖浏览器原生 `<select>`（语言与样式随系统变化）。
 ///
 /// - `allow_empty`：为真时提供「不限」入口清空取值（统计页月份范围可留空）

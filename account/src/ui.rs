@@ -518,7 +518,7 @@ pub(crate) fn parse_money(s: &str) -> Option<Money> {
 /// 当前已连接的后端地址（供桌面端关闭窗口时联动关闭后端）
 ///
 /// 桌面端 bin 需要在窗口关闭事件里调用 `POST /api/close`，但该回调不在 Dioxus
-/// 组件树内、拿不到 [`GlobalState`]；因此由 UI 侧（根组件 `App` 的 effect）
+/// 组件树内、拿不到 `GlobalState`；因此由 UI 侧（根组件 `App` 的 effect）
 /// 把「已连接的后端地址」写入此模块，bin 侧只读，避免两边各存一份状态。
 pub mod session {
     use std::sync::Mutex;
