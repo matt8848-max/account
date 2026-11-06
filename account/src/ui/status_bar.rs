@@ -9,7 +9,7 @@
 //! 三类组件都只占一行：详情浮层向上弹出，进度条为细横条，避免布局跳动。
 
 use super::update::{self, UpdateState};
-use super::{GlobalState, LIVE_INTERVAL_MS, now_str, open_external, ping, push_toast};
+use super::{GlobalState, LIVE_INTERVAL_MS, open_external, push_toast};
 use dioxus::prelude::*;
 
 /// 后端状态在底栏的展示（圆点、文案、颜色）
@@ -75,29 +75,6 @@ pub(crate) fn StatusBar() -> Element {
                     div { "版本：{api_version}" }
                     div { "状态：{live_text}（上次探测 {live_at}）" }
                     div { "自动探测间隔：{probe_minutes} 分钟" }
-                    div { style: "display:flex;gap:8px;justify-content:flex-end;margin-top:2px",
-                        button {
-                            onclick: move |_| {
-                                let mut st = st;
-                                spawn(async move {
-                                    let ok = ping(&st).await;
-                                    st.live_ok.set(ok);
-                                    st.live_at.set(now_str());
-                                });
-                            },
-                            "立即重测"
-                        }
-                        button {
-                            onclick: move |_| {
-                                let mut st = st;
-                                let mut show_detail = show_detail;
-                                show_detail.set(false);
-                                // 仅切回连接页视图，不断开连接
-                                st.show_connect.set(true);
-                            },
-                            "查看连接页"
-                        }
-                    }
                 }
             }
 

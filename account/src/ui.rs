@@ -10,6 +10,7 @@
 //! - `ui/master.rs`  — 交易对象/货币管理
 //! - `ui/stats.rs`   — 数据统计（含导出入口）
 //! - `ui/export.rs`  — 导出保存对话框（Web 下载 / 桌面另存为）
+//! - `ui/date.rs`    — 中文日期/时间/年月选择组件（可手输 + 日历面板）
 //! - `ui/update.rs`  — 启动时检测 GitHub 新版本
 //!
 //! 跨页公用的代码（全局状态、HTTP 封装、提示、确认弹窗等）保留在本文件。
@@ -21,6 +22,7 @@ use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 
 pub mod connect;
+pub mod date;
 pub mod export;
 pub mod master;
 pub mod records;
@@ -32,8 +34,9 @@ use update::UpdateState;
 
 // 让父模块（ui.rs）中的页面切换能直接引用子模块组件
 pub(crate) use connect::ConnectPage;
+pub(crate) use date::{DayTimeInput, MonthPicker};
 pub(crate) use master::MasterPage;
-pub(crate) use records::RecordsPage;
+pub(crate) use records::{RecordsPage, SortOrder};
 pub(crate) use stats::StatsPage;
 pub(crate) use status_bar::StatusBar;
 
@@ -126,6 +129,8 @@ pub(crate) struct GlobalState {
     pub query_to: Signal<String>,
     pub query_cp: Signal<String>,
     pub records: Signal<Vec<RecordView>>,
+    /// 记录列表排序方向（交易记录页标题右侧的切换按钮控制）
+    pub records_order: Signal<SortOrder>,
     pub new_group_name: Signal<String>,
     pub new_currency_name: Signal<String>,
     pub new_cp_name: Signal<String>,
@@ -271,88 +276,6 @@ pub(crate) fn dt_local(v: &str) -> String {
     }
 }
 
-/// 24 小时制时间输入：日期 + 时(00-23) + 分(00-59)
-///
-/// 浏览器原生 `datetime-local` 在部分系统（如 Windows）按 12 小时制（AM/PM）
-/// 显示；此组件改用 `type=date` + 时/分下拉框，强制 24 小时制。
-/// `value` 约定为 `YYYY-MM-DDTHH:MM`（无秒），变更时通过 `onchange` 回传。
-#[component]
-pub(crate) fn DayTimeInput(value: String, onchange: EventHandler<String>) -> Element {
-    let date = if value.len() >= 10 {
-        value[..10].to_string()
-    } else {
-        String::new()
-    };
-    let hour = if value.len() >= 13 {
-        value[11..13].to_string()
-    } else {
-        "00".to_string()
-    };
-    let minute = if value.len() >= 16 {
-        value[14..16].to_string()
-    } else {
-        "00".to_string()
-    };
-    let hours: Vec<String> = (0..24).map(|h| format!("{h:02}")).collect();
-    let minutes: Vec<String> = (0..60).map(|m| format!("{m:02}")).collect();
-    // String 非 Copy，需 clone 供不同闭包捕获；
-    // Callback 是 Copy，闭包内 move 即复制，无需 clone
-    let h_in = hour.clone();
-    let m_in = minute.clone();
-    let d_hs = date.clone();
-    let m_hs = minute.clone();
-    let d_ms = date.clone();
-    let h_ms = hour.clone();
-
-    rsx! {
-        div { style: "display:flex;gap:4px;align-items:center",
-            input {
-                r#type: "date",
-                value: date,
-                oninput: move |e| {
-                    let d = e.value();
-                    if d.is_empty() {
-                        onchange.call(String::new());
-                    } else {
-                        onchange.call(format!("{d}T{h_in}:{m_in}"));
-                    }
-                },
-            }
-            select {
-                value: hour,
-                onchange: move |e| {
-                    let h = e.value();
-                    if d_hs.is_empty() {
-                        onchange.call(String::new());
-                    } else {
-                        onchange.call(format!("{d_hs}T{h}:{m_hs}"));
-                    }
-                },
-                for h in hours {
-                    option { value: "{h}", "{h}" }
-                }
-            }
-            span { "时" }
-            span { ":" }
-            select {
-                value: minute,
-                onchange: move |e| {
-                    let m = e.value();
-                    if d_ms.is_empty() {
-                        onchange.call(String::new());
-                    } else {
-                        onchange.call(format!("{d_ms}T{h_ms}:{m}"));
-                    }
-                },
-                for m in minutes {
-                    option { value: "{m}", "{m}" }
-                }
-            }
-            span { "分" }
-        }
-    }
-}
-
 /// 取当前选中项的标签；未匹配时返回空串。
 ///
 /// `value = 0` 且候选中含 `(0, empty_label)` 时返回该标签（如「全部」）；
@@ -389,6 +312,8 @@ pub(crate) fn filter_candidates(candidates: &[(i64, String)], query: &str) -> Ve
 /// `candidates` 为 `(值, 标签)` 列表；`value` 为当前选中值；
 /// `empty_label` 提供时，候选顶部插入 `(0, empty_label)` 项（用于「全部」筛选）；
 /// 选择后回调 `onchange`。
+///
+/// 文字颜色：**已选项为黑色**（叠加层展示，便于阅读），**未选择时占位文本保持灰色**。
 #[component]
 pub(crate) fn SearchSelect(
     candidates: Vec<(i64, String)>,
@@ -416,6 +341,8 @@ pub(crate) fn SearchSelect(
 
     // 过滤候选：按标签子串匹配（忽略大小写）
     let filtered: Vec<(i64, String)> = filter_candidates(&all_candidates, &query());
+    // 输入框是否为空：为空时用黑字叠加展示已选项（灰色留给占位文本）
+    let query_is_empty = (query)().trim().is_empty();
 
     // 高亮索引（渲染时收敛到有效范围，避免过滤后越界）
     let highlight_idx = {
@@ -443,12 +370,14 @@ pub(crate) fn SearchSelect(
                 // value 只绑定用户输入，禁止回填已选标签：
                 // 旧实现把选中标签写进 value，用户删除文本后又被渲染填回（历史 bug）
                 value: query(),
-                // 未输入时用 placeholder 呈现当前选中项（灰字提示，不参与编辑）
+                // 占位文本只在「没有已选项」时使用，保持灰色（浏览器默认 ::placeholder 颜色）；
+                // 已选项改用下方叠加的黑字展示——placeholder 无法单独改色
                 placeholder: if selected_label.is_empty() {
                     placeholder
                 } else {
-                    selected_label
+                    String::new()
                 },
+                style: "color:#000",
                 oninput: move |e| {
                     query.set(e.value());
                     open.set(true);
@@ -482,6 +411,14 @@ pub(crate) fn SearchSelect(
                         query.set(String::new());
                     }
                 },
+            }
+            // 已选项以黑字叠加在输入框上：placeholder 只能是灰字，无法单独改色；
+            // 只在「输入框为空」时显示，用户开始输入即让位（pointer-events:none 不挡输入）
+            if query_is_empty && !selected_label.is_empty() {
+                span {
+                    style: "position:absolute;left:7px;top:50%;transform:translateY(-50%);color:#000;pointer-events:none;white-space:nowrap;max-width:calc(100% - 14px);overflow:hidden;text-overflow:ellipsis",
+                    "{selected_label}"
+                }
             }
             if open() {
                 div {
@@ -523,44 +460,124 @@ pub(crate) fn cp_label(c: &Counterparty, currencies: &[Currency]) -> String {
     format!("{} ({})", c.name, cur)
 }
 
-/// 解析金额文本为定点数 Money（如 "100"、"100.50"），失败返回 None
+/// 解析金额文本为定点数 Money（如 `100`、`100.50`、`-1.23`），失败返回 `None`
+///
+/// 规则：
+/// - 空文本（或全空白）视为 0：`初始余额` 允许留空
+/// - 只接受「可选负号 + ASCII 数字 + 至多一个小数点」，不接受正号、科学计数法、千位分隔符
+/// - **不限制小数位数**：精度由文本本身决定（`divisor = 10^位数`），
+///   只在 `divisor`（u32）或金额（i64）溢出时判定失败——业务上金额虽限定为正数，
+///   但解析器不该用业务上限掩盖溢出检测（人工评审要求）
+/// - 负数必须解析正确：先按绝对值累加，最后统一取负。
+///   （早期实现先减小数部分再取负，导致 `-1.23` 被算成 `-0.77`）
 pub(crate) fn parse_money(s: &str) -> Option<Money> {
     let s = s.trim();
     if s.is_empty() {
         return Some(Money::from_int(0));
     }
-    let negative = s.starts_with('-');
-    let digits = s.strip_prefix('-').unwrap_or(s);
+    // 先剥离负号：符号不参与数值累加，避免「先减小数再取负」的旧 bug
+    let (negative, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    // 负号后必须有内容，且只允许数字与小数点
     if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit() || c == '.') {
         return None;
     }
-    let parts: Vec<&str> = digits.split('.').collect();
-    if parts.len() > 2 {
+    let mut parts = digits.split('.');
+    let int_part = parts.next().unwrap_or("");
+    let frac_part = parts.next().unwrap_or("");
+    // 多于一个小数点（如 `1.2.3`）非法
+    if parts.next().is_some() {
         return None;
     }
-    let int_part = parts[0];
-    let frac_part = if parts.len() == 2 { parts[1] } else { "" };
+    // 小数点前必须有整数部分：`.5` 不接受，界面统一要求写成 `0.5`
     if int_part.is_empty() || !int_part.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    if !frac_part.chars().all(|c| c.is_ascii_digit()) || frac_part.len() > 6 {
-        return None;
-    }
+    // 精度：小数位数 → 10^n；n 过大导致 divisor 溢出 u32 时视为非法输入
     let divisor = if frac_part.is_empty() {
         1u32
     } else {
-        10u32.pow(frac_part.len() as u32)
+        10u32.checked_pow(frac_part.len() as u32)?
     };
     let int_val: i64 = int_part.parse().ok()?;
     let mut value = int_val.checked_mul(divisor as i64)?;
     if !frac_part.is_empty() {
         let frac_val: i64 = frac_part.parse().ok()?;
-        value += if negative { -frac_val } else { frac_val };
+        value = value.checked_add(frac_val)?;
     }
     if negative {
         value = -value;
     }
     Some(Money { value, divisor })
+}
+
+// ---------- 会话状态（跨 bin 共享） ----------
+
+/// 当前已连接的后端地址（供桌面端关闭窗口时联动关闭后端）
+///
+/// 桌面端 bin 需要在窗口关闭事件里调用 `POST /api/close`，但该回调不在 Dioxus
+/// 组件树内、拿不到 [`GlobalState`]；因此由 UI 侧（根组件 `App` 的 effect）
+/// 把「已连接的后端地址」写入此模块，bin 侧只读，避免两边各存一份状态。
+pub mod session {
+    use std::sync::Mutex;
+
+    /// 已连接的后端地址；`None` 表示当前未连接（或已断开）
+    static ACTIVE_BASE: Mutex<Option<String>> = Mutex::new(None);
+
+    /// 取锁：互斥量被毒化（持锁线程 panic）时取回内部值，UI 状态不值得因此崩溃
+    fn lock() -> std::sync::MutexGuard<'static, Option<String>> {
+        ACTIVE_BASE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 记录当前已连接的后端地址（连接成功 / 地址变化时调用）
+    pub fn set_active(base: &str) {
+        *lock() = Some(base.trim().to_string());
+    }
+
+    /// 当前已连接的后端地址；未连接时为 `None`
+    pub fn active_base() -> Option<String> {
+        lock().clone()
+    }
+
+    /// 清除会话（断开连接 / 服务器已关闭后调用）
+    pub fn clear() {
+        *lock() = None;
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::session;
+
+    /// 验证会话缓存的写入、读取与清除：
+    /// UI 侧写入后 bin 侧能读到同一地址；清除后必须读不到（避免退出时误发关闭请求）
+    #[test]
+    fn session_should_store_and_clear_active_base() {
+        session::clear();
+        assert_eq!(session::active_base(), None, "初始应为未连接");
+
+        session::set_active("https://127.0.0.2:3000");
+        assert_eq!(
+            session::active_base().as_deref(),
+            Some("https://127.0.0.2:3000")
+        );
+        // 前后空白被裁剪（用户手输地址常见）
+        session::set_active("  https://127.0.0.1:3001  ");
+        assert_eq!(
+            session::active_base().as_deref(),
+            Some("https://127.0.0.1:3001")
+        );
+
+        session::clear();
+        assert_eq!(session::active_base(), None);
+        // 不相等断言：清除后不能残留上一次的地址
+        assert_ne!(
+            session::active_base().as_deref(),
+            Some("https://127.0.0.1:3001")
+        );
+    }
 }
 
 // ---------- 平台睡眠 ----------
@@ -931,6 +948,8 @@ pub fn App() -> Element {
         query_to: use_signal(now_local_iso),
         query_cp: use_signal(String::new),
         records: use_signal(Vec::new),
+        // 默认从新到旧：最新记录排在最上面
+        records_order: use_signal(|| SortOrder::NewestFirst),
         new_group_name: use_signal(String::new),
         new_currency_name: use_signal(String::new),
         new_cp_name: use_signal(String::new),
@@ -951,15 +970,27 @@ pub fn App() -> Element {
     // 启动时检测一次 GitHub 是否发布了新版本；use_hook 只在 App 挂载时执行一次，
     // 之后无论怎么切换页面/重渲染都不会自动重试（重试只能由状态栏点击触发）
     use_hook(move || update::spawn_check(st));
-    // 显示连接页的情形：尚未连接，或用户主动从主界面切回连接页（保持 connected 不变）
-    if (st.show_connect)() || !(st.connected)() {
-        rsx! {
-        style { {GLOBAL_CSS} }
-            ConnectPage {}
+    // 把「连接状态 + 后端地址」同步到跨 bin 的会话缓存：
+    // 桌面端窗口关闭时 bin 侧据此决定是否调用 POST /api/close
+    use_effect(move || {
+        if (st.connected)() {
+            session::set_active(&(st.base)());
+        } else {
+            session::clear();
         }
-    } else {
-        rsx! { style { {GLOBAL_CSS} }
-        MainLayout {} }
+    });
+
+    rsx! {
+        style { {GLOBAL_CSS} }
+        // 站点图标（图标资产由 tools/make_icons.py 生成，dx 会把 public/ 拷到输出根）
+        document::Link { rel: "icon", href: "/favicon.ico" }
+        document::Link { rel: "apple-touch-icon", href: "/apple-touch-icon-180.png" }
+        // 显示连接页的情形：尚未连接，或用户主动从主界面切回连接页（保持 connected 不变）
+        if (st.show_connect)() || !(st.connected)() {
+            ConnectPage {}
+        } else {
+            MainLayout {}
+        }
     }
 }
 
@@ -987,13 +1018,23 @@ fn MainLayout() -> Element {
             // 最外层纵向布局：内容行（侧栏 + main）占满剩余高度，底部状态栏固定高度
             style: "display:flex;flex-direction:column;height:100dvh;margin:0;overflow:hidden",
             div { style: "display:flex;flex:1;min-height:0;overflow:hidden",
-                aside { style: "width:200px;border-right:1px solid #ddd;padding:10px;display:flex;flex-direction:column;flex-shrink:0",
-                    h2 { "记账软件" }
+                aside { style: "width:200px;border-right:1px solid #ddd;padding:10px;display:flex;flex-direction:column;gap:8px;flex-shrink:0",
+                    h2 { style: "margin:0", "菜单栏" }
                     // 版本（API/DB）不在此显示：底部状态栏的「后端连接详情」里已有，避免重复
                     nav { style: "display:flex;flex-direction:column;gap:8px",
                         button { onclick: move |_| st.page.set(Page::Records), "📒 交易记录" }
                         button { onclick: move |_| st.page.set(Page::Master), "🏦 对象/货币" }
                         button { onclick: move |_| st.page.set(Page::Stats), "📊 数据统计" }
+                    }
+                    // 页脚按钮区：margin-top:auto 贴到菜单栏最下方，
+                    // column-reverse 让按钮从下往上排（与顶部菜单拉开距离，避免误触）
+                    div { style: "margin-top:auto;display:flex;flex-direction:column-reverse;gap:8px",
+                        button {
+                            style: "background:#f0f0f0;border:1px solid #ccc;color:#333;padding:6px 10px;border-radius:4px;cursor:pointer;text-align:left",
+                            title: "返回连接页（不断开连接）",
+                            onclick: move |_| st.show_connect.set(true),
+                            "↩ 返回连接页"
+                        }
                     }
                 }
                 main { style: "flex:1;padding:16px;overflow:auto;min-width:0",
@@ -1012,7 +1053,10 @@ fn MainLayout() -> Element {
 
 #[cfg(test)]
 mod tests {
-    use super::{TaskProgress, filter_candidates, is_safe_external_url, selected_label_of};
+    use super::{
+        TaskProgress, filter_candidates, is_safe_external_url, parse_money, selected_label_of,
+    };
+    use crate::models::Money;
 
     /// 候选项集合（含「全部」项，值 0）
     fn candidates() -> Vec<(i64, String)> {
@@ -1101,5 +1145,53 @@ mod tests {
         assert!(!is_safe_external_url("http://example.com"));
         assert!(!is_safe_external_url("javascript:alert(1)"));
         assert!(!is_safe_external_url("https://example.com/a b"));
+    }
+
+    /// 验证金额文本解析的合法性：正负整数/小数、空文本视为 0，且不限制小数位数
+    /// （人工评审要求：金额业务上限定为正数，但解析器必须能正确解析负号与长小数）
+    #[test]
+    fn parse_money_should_parse_sign_and_decimals() {
+        assert_eq!(parse_money("100"), Some(Money::from_int(100)));
+        assert_eq!(parse_money("-100"), Some(Money::from_int(-100)));
+        assert_eq!(parse_money("1.23"), Some(Money::new(123, 100).unwrap()));
+        assert_eq!(parse_money("-1.23"), Some(Money::new(-123, 100).unwrap()));
+        // 整数部分为 0 的小额负数：符号与补零都必须正确（旧实现会算成 -0.77 这类错误值）
+        assert_eq!(parse_money("-0.05"), Some(Money::new(-5, 100).unwrap()));
+        // 6 位以上小数不再被拒绝：精度由文本决定
+        assert_eq!(
+            parse_money("0.0000001"),
+            Some(Money::new(1, 10_000_000).unwrap())
+        );
+        // 空文本 / 全空白视为 0（「初始余额」允许留空）
+        assert_eq!(parse_money(""), Some(Money::from_int(0)));
+        assert_eq!(parse_money("   "), Some(Money::from_int(0)));
+        // 前后空白会被裁剪
+        assert_eq!(parse_money("  -12.5 "), Some(Money::new(-125, 10).unwrap()));
+
+        // 不相等断言：解析结果不能与错误的金额相等（防止符号/精度实现错误）
+        assert_ne!(parse_money("-1.23"), Some(Money::new(-77, 100).unwrap()));
+        assert_ne!(parse_money("1.23"), Some(Money::new(1230, 100).unwrap()));
+        assert_ne!(parse_money("-100"), Some(Money::from_int(100)));
+    }
+
+    /// 验证金额文本解析的非法输入：非数字字符、多个小数点、缺整数部分、
+    /// 以及精度/数值溢出（不靠业务上限拒绝，只靠溢出检测拒绝）
+    #[test]
+    fn parse_money_should_reject_invalid_and_overflowing_input() {
+        assert_eq!(parse_money("abc"), None);
+        assert_eq!(parse_money("1.2.3"), None);
+        assert_eq!(parse_money("-"), None);
+        assert_eq!(parse_money("."), None);
+        // 缺整数部分：界面统一要求写成 0.5
+        assert_eq!(parse_money(".5"), None);
+        assert_eq!(parse_money("1,000"), None);
+        assert_eq!(parse_money("+1"), None);
+        assert_eq!(parse_money("1e3"), None);
+        // 小数位数过多导致 divisor（u32）溢出
+        assert_eq!(parse_money("0.0000000001"), None);
+        // 整数部分超出 i64
+        assert_eq!(parse_money("99999999999999999999"), None);
+        // 数值乘以精度后溢出 i64
+        assert_eq!(parse_money("92233720368547758.08"), None);
     }
 }

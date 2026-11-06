@@ -1,6 +1,6 @@
 //! 第三页：数据统计
 //!
-//! 对象统计：月份范围（`input type="month"`）+ 双栏交易对象选择
+//! 对象统计：月份范围（中文年月选择 [`MonthPicker`]，可留空表示不限）+ 双栏交易对象选择
 //! （左侧可搜索列表点「添加」，右侧为已选列表可「踢出」，添加自动去重），
 //! 按**交易对象分组**展示：每组先显示一次当前余额（蓝），
 //! 再列出所选月份范围内各月的收入（绿）/支出（红）/结算余额（蓝）。
@@ -12,8 +12,8 @@
 
 use super::export::{ExportJob, ExportSaveDialog, ExportTarget, spawn_export};
 use super::{
-    ConfirmDialog, GlobalState, MonthStatView, ObjectGroupView, ObjectStatView, cp_label, http_put,
-    push_toast,
+    ConfirmDialog, GlobalState, MonthPicker, MonthStatView, ObjectGroupView, ObjectStatView,
+    cp_label, http_put, push_toast,
 };
 use crate::export::range_label;
 use crate::models::{Counterparty, Currency, Money};
@@ -226,16 +226,16 @@ pub(crate) fn StatsPage() -> Element {
                 strong { "对象统计" }
                 div { style: "display:flex;gap:8px;margin-top:6px;flex-wrap:wrap;align-items:center",
                     label { "月份:" }
-                    input {
-                        r#type: "month",
+                    MonthPicker {
                         value: stats_from,
-                        oninput: move |e| st.stats_from.set(e.value()),
+                        allow_empty: true,
+                        onchange: move |v: String| st.stats_from.set(v),
                     }
                     span { "至" }
-                    input {
-                        r#type: "month",
+                    MonthPicker {
                         value: stats_to,
-                        oninput: move |e| st.stats_to.set(e.value()),
+                        allow_empty: true,
+                        onchange: move |v: String| st.stats_to.set(v),
                     }
                 }
 

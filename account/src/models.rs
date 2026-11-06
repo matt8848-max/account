@@ -255,7 +255,35 @@ pub struct RangeQuery {
 mod tests {
     use super::*;
 
-    /// 验证去零：公共 10 因子被约掉，且值与展示均不变
+    /// 确定性伪随机数生成器（线性同余）。
+    ///
+    /// 金额运算的「无明确边界」场景需要随机覆盖取值空间，但为测试引入 `rand` 依赖
+    /// 会增加编译成本；这里用固定种子的 LCG 即可得到可复现的随机序列。
+    struct Lcg(u64);
+
+    impl Lcg {
+        /// 以指定种子构造（种子强制为奇数，避免 LCG 退化）
+        fn new(seed: u64) -> Self {
+            Self(seed | 1)
+        }
+
+        /// 生成 `[lo, hi]` 闭区间内的整数
+        fn range(&mut self, lo: i64, hi: i64) -> i64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let span = (hi - lo) as u64 + 1;
+            lo + ((self.0 >> 11) % span) as i64
+        }
+    }
+
+    /// 按数值比较两个定点数：允许精度不同（交叉相乘避免浮点误差）
+    fn same_value(a: Money, b: Money) -> bool {
+        a.value as i128 * b.divisor as i128 == b.value as i128 * a.divisor as i128
+    }
+
+    /// 验证去零：公共 10 因子被约掉，覆盖正负两域，并配套「不应相等」的用例
     #[test]
     fn normalized_removes_common_zero_factor() {
         assert_eq!(
@@ -286,6 +314,30 @@ mod tests {
             .normalized(),
             Money::from_int(-4)
         );
+        // 负数只约掉一层：(-410, 100) = -4.10 → (-41, 10) = -4.1（人工评审补充用例）
+        assert_eq!(
+            Money {
+                value: -410,
+                divisor: 100
+            }
+            .normalized(),
+            Money {
+                value: -41,
+                divisor: 10
+            }
+        );
+        // (-41, 10) 已无公共 10 因子，保持原样（评审补充用例）
+        assert_eq!(
+            Money {
+                value: -41,
+                divisor: 10
+            }
+            .normalized(),
+            Money {
+                value: -41,
+                divisor: 10
+            }
+        );
         // 无法整除时保持原样
         assert_eq!(
             Money {
@@ -307,6 +359,72 @@ mod tests {
             .normalized(),
             Money::from_int(0)
         );
+
+        // 不相等断言：数值不同的金额不能被约成相等（防止实现「约多了」）
+        assert_ne!(
+            Money {
+                value: -410,
+                divisor: 100
+            }
+            .normalized(),
+            Money::from_int(-4)
+        );
+        assert_ne!(
+            Money {
+                value: 13,
+                divisor: 10
+            }
+            .normalized(),
+            Money::from_int(1)
+        );
+        // 不相等断言：正负号相反的两笔金额永远不相等
+        assert_ne!(
+            Money {
+                value: -410,
+                divisor: 100
+            }
+            .normalized(),
+            Money {
+                value: 410,
+                divisor: 100
+            }
+            .normalized()
+        );
+    }
+
+    /// 验证去零在随机取值（含负数域）下既不改变数值、也保持幂等，
+    /// 且不会把非零金额约成零、不会丢掉符号
+    #[test]
+    fn normalized_should_preserve_value_and_be_idempotent() {
+        let mut rng = Lcg::new(0x5eed_1234);
+        for _ in 0..256 {
+            // 金额精度约定为 10 的幂，故 divisor 取 10^0..10^6
+            let divisor = 10u32.pow(rng.range(0, 6) as u32);
+            // value 额外乘 10 的 0~2 次幂，制造「可约」与「不可约」两类输入
+            let factor = 10i64.pow(rng.range(0, 2) as u32);
+            let value = rng.range(-999_999, 999_999) * factor;
+            let money = Money { value, divisor };
+            let norm = money.normalized();
+
+            assert!(
+                same_value(money, norm),
+                "去零改变了数值: {:?} -> {:?}",
+                money,
+                norm
+            );
+            assert_eq!(norm.normalized(), norm, "去零应幂等: {:?}", norm);
+            assert_eq!(
+                norm.value < 0,
+                value < 0,
+                "去零不应丢失符号: {:?} -> {:?}",
+                money,
+                norm
+            );
+            // 不相等断言：非零金额约分后不能变成 0
+            if value != 0 {
+                assert_ne!(norm.value, 0, "非零金额被约成 0: {:?}", money);
+            }
+        }
     }
 
     /// 验证题述场景：1.3 + 2.7 = 4.0，计算结果自动去零为 (4, 1)
@@ -375,6 +493,107 @@ mod tests {
             .unwrap();
         assert_eq!(negative, Money::from_int(-2));
         assert_eq!(negative.to_decimal_string(), "-2");
+    }
+
+    /// 验证加减法在随机取值（含负数域）下满足「加后减回原值」，
+    /// 且错误的金额不会被判为相等（正负号、精度差异都不影响结果）
+    #[test]
+    fn add_sub_should_handle_negative_and_random_values() {
+        let mut rng = Lcg::new(0xabcd_9876);
+        for _ in 0..256 {
+            // divisor 取 10^0..10^4、value 取 ±10^6 以内：相乘后不会触发 i64 溢出
+            let da = 10u32.pow(rng.range(0, 4) as u32);
+            let db = 10u32.pow(rng.range(0, 4) as u32);
+            let a = Money {
+                value: rng.range(-1_000_000, 1_000_000),
+                divisor: da,
+            };
+            let b = Money {
+                value: rng.range(-1_000_000, 1_000_000),
+                divisor: db,
+            };
+
+            let sum = a.checked_add(b).expect("合法金额相加不应失败");
+            // 交换律：a + b == b + a
+            let sum_swapped = b.checked_add(a).expect("合法金额相加不应失败");
+            assert!(
+                same_value(sum, sum_swapped),
+                "加法应满足交换律: {:?} + {:?}",
+                a,
+                b
+            );
+            // 减法回退：a + b - b == a（数值相等即可，精度可能不同）
+            let back = sum.checked_sub(b).expect("合法金额相减不应失败");
+            assert!(
+                same_value(back, a),
+                "加后减回应等于原值: ({:?} + {:?}) - {:?} = {:?}",
+                a,
+                b,
+                b,
+                back
+            );
+            // 不相等断言：加法的结果不能被误判为只等于其中一个加数（除非另一个为 0）
+            if b.value != 0 && !same_value(b, Money::from_int(0)) {
+                assert!(
+                    !same_value(sum, a),
+                    "非零加数不应使和等于被加数: {:?} + {:?}",
+                    a,
+                    b
+                );
+            }
+            // 不相等断言：a 与 -a 的数值必须不同（b 为 0 时逐笔核对符号）
+            if b.value == 0 {
+                assert!(
+                    !same_value(
+                        a,
+                        Money {
+                            value: -a.value,
+                            divisor: a.divisor
+                        }
+                    ) || a.value == 0,
+                    "正负金额不应相等: {:?}",
+                    a
+                );
+            }
+        }
+    }
+
+    /// 验证小数展示：负数与不足一位的整数部分都能正确补零（如 -0.05、-4.1）
+    #[test]
+    fn to_decimal_string_should_render_negative_values() {
+        assert_eq!(
+            Money {
+                value: -5,
+                divisor: 100
+            }
+            .to_decimal_string(),
+            "-0.05"
+        );
+        assert_eq!(
+            Money {
+                value: -41,
+                divisor: 10
+            }
+            .to_decimal_string(),
+            "-4.1"
+        );
+        assert_eq!(
+            Money {
+                value: -1230,
+                divisor: 1000
+            }
+            .to_decimal_string(),
+            "-1.23"
+        );
+        // 不相等断言：负号不能丢失
+        assert_ne!(
+            Money {
+                value: -5,
+                divisor: 100
+            }
+            .to_decimal_string(),
+            "0.05"
+        );
     }
 
     /// 验证非法除数返回错误而不是 panic
