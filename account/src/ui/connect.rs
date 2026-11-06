@@ -2,7 +2,7 @@
 //!
 //! 单页五行（整体仍居中）：
 //! 1. 标题
-//! 2. `输入后端地址：` + 输入框（默认 `https://127.0.0.2:3000`）+ 连接按钮
+//! 2. `输入后端地址：` + 输入框（默认 `https://127.0.0.2:3000`）
 //! 3. 灰色可复制文本：后端地址默认值
 //! 4. 连接 / 断开 / 关闭服务器（不可用的一律灰底灰字并 `disabled`）
 //! 5. 信息提示（连接状态 + Toast）
@@ -75,7 +75,7 @@ fn disconnect(st: &GlobalState) {
     session::clear();
 }
 
-/// 「连接」按钮的公共行为（第二行与第四行两个按钮共用，避免两套实现）
+/// 「连接」按钮的公共行为（第四行按钮调用；独立成函数便于后续复用）
 ///
 /// 1. 未连接：探测连通 + 拉取初始数据 → 进入主界面
 /// 2. 已连接且地址未变：直接返回主界面（连接按钮兼任「返回」）
@@ -161,7 +161,7 @@ pub(crate) fn ConnectPage() -> Element {
             // 第一行：标题
             h1 { style: "margin:0", "记账软件" }
 
-            // 第二行：地址输入 + 连接
+            // 第二行：地址输入（连接按钮在第四行）
             div { style: "display:flex;gap:8px;align-items:center",
                 label { "输入后端地址：" }
                 input {
@@ -169,12 +169,6 @@ pub(crate) fn ConnectPage() -> Element {
                     placeholder: DEFAULT_BASE,
                     style: "width:260px",
                     oninput: move |e| st.base.set(e.value()),
-                }
-                button {
-                    style: connect_style,
-                    disabled: connecting_now,
-                    onclick: move |_| on_connect_clicked(st, connecting),
-                    if connecting_now { "连接中..." } else { "🔗 连接" }
                 }
             }
 
@@ -188,9 +182,9 @@ pub(crate) fn ConnectPage() -> Element {
                 button {
                     style: connect_style,
                     disabled: connecting_now,
-                    // 与第二行的连接按钮完全同一套行为（连接 / 返回主页面 / 地址变更后重连）
+                    // 连接按钮兼任「返回主页面」：地址变更时按新地址重连
                     onclick: move |_| on_connect_clicked(st, connecting),
-                    "🔗 连接"
+                    if connecting_now { "连接中..." } else { "🔗 连接" }
                 }
                 button {
                     style: disconnect_style,
