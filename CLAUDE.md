@@ -28,9 +28,8 @@
 记账软件/
 ├── CLAUDE.md
 ├── README.md            ← 软件说明（功能、支持平台、安装与使用）
-├── 更新日志.md          ← CHANGELOG（0.3.0 → 0.4.3）
+├── 更新日志.md          ← CHANGELOG（0.3.0 → 0.4.2）
 ├── LICENSE              ← MIT
-├── tools/make_icons.py  ← 由原图生成 favicon / 桌面图标资产（uv + Pillow，近邻缩放）
 ├── .github/workflows/
 │   └── release.yml      ← push main 自动构建 + 以 Cargo 版本为 tag 创建 Release
 └── account/             # 单包双 bin（account_server + account_client 共享代码）
@@ -331,9 +330,6 @@ cargo build --target wasm32-unknown-unknown --bin account_client --features clie
 dx build --release --platform web --bin account_client --features bundle,client   # Dioxus 打包（必须指明 bin=account_client）
 cargo run --bin account_client --features client             # 桌面客户端（native）
 dx bundle --release --platform desktop --bin account_client --features bundle,client  # 桌面安装包
-
-# 图标资产（favicon / 桌面窗口图标）
-uv run ../tools/make_icons.py 原图.jpg --delete-source
 
 # 安装 dioxus-cli（指定版本）
 cargo install dioxus-cli --version 0.7.10
