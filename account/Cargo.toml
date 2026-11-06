@@ -1,19 +1,19 @@
 [package]
 name = "account"
-version = "0.4.1"
+version = "0.4.3"
 edition = "2024"
 description = "Personal bookkeeping app (axum server + Dioxus client)"
 license = "MIT"
 repository = "https://github.com/matt8848-max/account"
 
 [[bin]]
-name = "server"
-path = "bin/server.rs"
+name = "account_server"
+path = "bin/account_server.rs"
 
 [[bin]]
-name = "client"
-path = "bin/client.rs"
-# 客户端依赖 UI（Dioxus），需启用 client 特性：cargo run --bin client --features client
+name = "account_client"
+path = "bin/account_client.rs"
+# 客户端依赖 UI（Dioxus），需启用 client 特性：cargo run --bin account_client --features client
 required-features = ["client"]
 
 [features]

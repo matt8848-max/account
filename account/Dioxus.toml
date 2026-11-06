@@ -1,10 +1,16 @@
 [application]
+# 应用名（安装包/窗口程序名，与 bin 名保持一致）
+name = "account_client"
+# Web 静态资源目录：dx 会把其中文件原样拷贝到 Web 构建产物根目录，
+# 图标资产（favicon.ico / icon-*.png / apple-touch-icon-*.png）由 tools/make_icons.py 生成
+asset_dir = "public"
 
 [bundle]
 identifier = "com.account.app"
 publisher = "Account"
 resources = []
-icon = []
+# 安装包/可执行文件图标（Windows 资源图标、Linux/macOS 图标源）
+icon = ["assets/icon-256.png"]
 
 [bundle.windows]
 webview_install_mode = "Skip"

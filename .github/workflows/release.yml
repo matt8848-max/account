@@ -59,9 +59,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: windows-latest, asset: windows-x64, arch: x86_64-pc-windows-msvc }
-          - { os: ubuntu-latest, asset: linux-x64, arch: x86_64-unknown-linux-gnu }
-          - { os: macos-14, asset: macos-arm64, arch: aarch64-apple-darwin }
+          - os: windows-latest
+            asset: windows-x64
+            arch: x86_64-pc-windows-msvc
+            rustflags: ""
+          # Linux 用 musl + crt-static 产出**完全静态**的二进制：
+          # 不依赖 glibc / libgcc 等系统动态库，可在各类 x86_64 发行版上直接运行
+          - os: ubuntu-latest
+            asset: linux-x64
+            arch: x86_64-unknown-linux-musl
+            rustflags: "-C target-feature=+crt-static"
+          - os: macos-14
+            asset: macos-arm64
+            arch: aarch64-apple-darwin
+            rustflags: ""
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@v7
 
@@ -69,31 +82,60 @@ jobs:
         with:
           targets: ${{ matrix.arch }}
 
-      # server 不启用 client 特性 → 依赖图里没有 dioxus/GTK/WebKit，
+      # musl 目标编译 bundled SQLite（C 代码）需要 musl-gcc
+      - name: 安装 musl 工具链
+        if: matrix.arch == 'x86_64-unknown-linux-musl'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      # 计算端不启用 client 特性 → 依赖图里没有 dioxus/GTK/WebKit，
       # 因此 Linux 上无需安装任何 GUI 开发库
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: account
 
-      - name: 构建 server（release）
+      - name: 构建计算端（release）
         working-directory: account
-        run: cargo build --release --bin server --target ${{ matrix.arch }}
+        run: cargo build --release --bin account_server --target ${{ matrix.arch }}
+
+      - name: 断言静态链接（Linux）
+        if: matrix.arch == 'x86_64-unknown-linux-musl'
+        shell: bash
+        working-directory: account
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.arch }}/release/account_server"
+          file "$bin"
+          # 完全静态的二进制没有任何 NEEDED 动态库依赖
+          if readelf -d "$bin" | grep -q 'NEEDED'; then
+            echo "产物仍依赖动态库：" >&2
+            readelf -d "$bin" >&2
+            exit 1
+          fi
 
       - name: 打包产物
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          bin="account/target/${{ matrix.arch }}/release/server"
+          bin="account/target/${{ matrix.arch }}/release/account_server"
           if [ "${{ runner.os }}" = "Windows" ]; then
             bin="$bin.exe"
           fi
           if [ "${{ runner.os }}" = "Windows" ]; then
-            powershell -Command "Compress-Archive -Path '$bin' -DestinationPath 'dist/account-server-${{ matrix.asset }}.zip' -Force"
+            powershell -Command "Compress-Archive -Path '$bin' -DestinationPath 'dist/account_server-${{ matrix.asset }}.zip' -Force"
           else
-            tar -czf "dist/account-server-${{ matrix.asset }}.tar.gz" -C "$(dirname "$bin")" "$(basename "$bin")"
+            tar -czf "dist/account_server-${{ matrix.asset }}.tar.gz" -C "$(dirname "$bin")" "$(basename "$bin")"
           fi
           ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: server-${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
 
       - uses: actions/upload-artifact@v7
         with:
@@ -159,23 +201,23 @@ jobs:
       # Windows 不内嵌 WebView2 运行时，Linux/macOS 使用系统 WebView。
       - name: 构建桌面客户端（裸二进制）
         working-directory: account
-        run: cargo build --release --bin client --features client
+        run: cargo build --release --bin account_client --features client
 
       - name: 生成安装包 / .app（打包器失败不影响发布，仍会附带裸二进制）
         working-directory: account
         continue-on-error: true
-        run: dx bundle --release --platform desktop --bin client --features bundle,client --package-types ${{ matrix.package_type }}
+        run: dx bundle --release --platform desktop --bin account_client --features bundle,client --package-types ${{ matrix.package_type }}
 
       - name: 归档客户端产物
         shell: bash
         run: |
           set -euo pipefail
-          name="account-client-${{ matrix.asset }}"
+          name="account_client-${{ matrix.asset }}"
           mkdir -p dist stage
           if [ "${{ runner.os }}" = "Windows" ]; then
-            cp account/target/release/client.exe stage/
+            cp account/target/release/account_client.exe stage/
           else
-            cp account/target/release/client stage/
+            cp account/target/release/account_client stage/
           fi
           # dx 打包产物：安装包（.exe/.msi/.deb）与 macOS .app
           find account/target/dx -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.deb' \) -exec cp {} stage/ \; 2>/dev/null || true
@@ -223,7 +265,7 @@ jobs:
 
       - name: 构建 Web 客户端
         working-directory: account
-        run: dx build --release --platform web --bin client --features bundle,client
+        run: dx build --release --platform web --bin account_client --features bundle,client
 
       - name: 归档 Web 静态站点
         shell: bash
@@ -236,7 +278,7 @@ jobs:
             exit 1
           fi
           mkdir -p dist
-          (cd "$public_dir" && zip -r "$GITHUB_WORKSPACE/dist/account-web-wasm.zip" .)
+          (cd "$public_dir" && zip -r "$GITHUB_WORKSPACE/dist/account_web-wasm.zip" .)
           ls -l dist
 
       - uses: actions/upload-artifact@v7
