@@ -28,15 +28,18 @@
 记账软件/
 ├── CLAUDE.md
 ├── README.md            ← 软件说明（功能、支持平台、安装与使用）
-├── 更新日志.md          ← CHANGELOG（0.3.0 → 0.4.1）
+├── 更新日志.md          ← CHANGELOG（0.3.0 → 0.4.2）
 ├── LICENSE              ← MIT
 ├── .github/workflows/
 │   └── release.yml      ← push main 自动构建 + 以 Cargo 版本为 tag 创建 Release
-└── account/             # 单包双 bin（server + client 共享代码）
+└── account/             # 单包双 bin（account_server + account_client 共享代码）
     ├── Cargo.toml
+    ├── Dioxus.toml      ← asset_dir="public"、bundle.icon="assets/icon-256.png"
+    ├── public/          ← Web 静态资源（favicon.ico、icon-*.png，dx 原样拷贝到产物根）
+    ├── assets/          ← icon-256.png（编译期 include_bytes! 嵌入桌面窗口图标）
     ├── bin/
-    │   ├── server.rs    # 计算端（native）— CLI 参数 + TLS + HTTP/2 + API 路由 + 优雅关闭
-    │   └── client.rs    # 客户端启动器（native 桌面 / wasm Web）
+    │   ├── account_server.rs # 计算端（native）— CLI 参数 + TLS + HTTP/2 + API 路由 + 优雅关闭
+    │   └── account_client.rs # 客户端启动器（native 桌面 / wasm Web；窗口图标 + 关闭联动关后端）
     └── src/
         ├── lib.rs       ← 统一模块导出（export/models/api/db/ui）
         ├── export.rs    ← xlsx 导出（纯逻辑：月份边界、汇总、sheet 名清洗、工作簿生成）
@@ -46,8 +49,9 @@
         ├── db/month.rs  ← 月表操作（组/记录 CRUD、group_months、月度统计）
         └── ui.rs        ← 客户端 UI 公共父模块（全局状态、HTTP 封装、提示、确认弹窗、主布局）
         └── ui/
-            ├── connect.rs  ← 连接页（含「关闭服务器」按钮）
-            ├── records.rs  ← 交易记录浏览器（删除记录/组有确认弹窗；进入页面自动刷新）
+            ├── connect.rs  ← 连接页（标题 / 地址输入 / 连接·断开·关闭服务器 / 提示，共五行）
+            ├── date.rs     ← 中文日期组件（DatePicker 可手输+日历、TimePicker、DayTimeInput、MonthPicker）
+            ├── records.rs  ← 交易记录浏览器（排序切换、删除确认、进入页面自动刷新）
             ├── master.rs   ← 交易对象/货币管理（删除有确认弹窗）
             ├── stats.rs    ← 数据统计（含「📤 导出交易记录」入口）
             ├── export.rs   ← 导出（保存目标选择 + 后台导出任务 + 进度）
@@ -59,15 +63,24 @@
 - `[target.'cfg(not(target_arch = "wasm32"))']` — axum/axum-server/rusqlite(bundled)/tokio/reqwest/rcgen/rust_xlsxwriter；
   `dioxus(desktop)` 与 `rfd` 为 **optional**，仅 `client` 特性启用
 - `[target.wasm32-unknown-unknown]` — rust_xlsxwriter(wasm feature)；`dioxus(web)/gloo-net/gloo-timers/web-sys/wasm-bindgen/js-sys` 均为 **optional**，仅 `client` 特性启用
-- **`client` 特性**：开启后才编译 `src/ui.rs`（`#[cfg(feature = "client")]`）与 `[[bin]] client`
-  （`required-features = ["client"]`），因此 server 的依赖图里**没有** dioxus/GTK/WebKit
+- **`client` 特性**：开启后才编译 `src/ui.rs`（`#[cfg(feature = "client")]`）与 `[[bin]] account_client`
+  （`required-features = ["client"]`），因此 account_server 的依赖图里**没有** dioxus/GTK/WebKit
 
 ## 架构与数据流
 
 - 客户端启动 → 连接页输入后端地址 → `live` 探测连通 → 进入主界面
-- 主界面每 5 分钟自动通过 `live` 接口探测存活；**底部状态栏**只显示存活/失联（有颜色），点击展开详情浮层（地址、版本、上次探测时间、立即重测、查看连接页）
+- 主界面每 5 分钟自动通过 `live` 接口探测存活；**底部状态栏**只显示存活/失联（有颜色），点击展开详情浮层（地址、版本、上次探测时间、自动探测间隔）
 - 界面提示统一写入 `GlobalState.toast`，在主界面**底部状态栏**右侧单行展示（连接页则显示在页面内），3 秒后自动消失；**不再调用浏览器原生 `alert`**（避免「URL says …」这类原生弹窗）
-- 连接页提供「关闭服务器」按钮：未连接时灰色禁用；连接后红色可点，点击后弹确认框，调用 `POST /api/close` 优雅关闭后端
+- 连接页为固定五行布局：标题 / 地址输入 / 默认地址灰字提示 / 连接·断开·关闭服务器 / 信息提示。
+  「连接」按钮**兼任进入与返回主页面**（已连接且地址未变则直接返回，地址改过则先断开再重连）；
+  「断开」只断开网络连接（清缓存、保留地址、留在本页）；「关闭服务器」弹确认框后调用 `POST /api/close`
+- 桌面端**关闭窗口（含系统关闭按钮）时联动关闭后端**：`bin/account_client.rs` 用
+  `Config::with_custom_event_handler` 捕获 `WindowEvent::CloseRequested`，读取 `ui::session` 中的
+  当前后端地址并 `POST /api/close`（1.5s 超时，失败仅 `warn` 日志），避免留下后台进程。
+  **注意**：该回调运行在 Dioxus 事件循环线程上，而该线程已在 tokio 运行时内，
+  直接 `block_on` 新运行时会 panic（`Cannot start a runtime from within a runtime`），
+  因此请求放在独立线程的运行时里执行（`run_on_new_thread`：std 通道 + 超时等待），
+  并有 `#[tokio::test]` 回归用例覆盖这一场景
 - **防呆设计**：删除记录/删除组/删除货币/删除交易对象/关闭服务器，均先弹确认框并列出将删除的内容（`ConfirmDialog`），确认后才执行
 - 前端启动时拉取全部交易对象与货币存入内存缓存；增删成功后才更新缓存
 - 所有增删改查均以后端成功响应为准再更新前端显示，未指定处理方式的失败弹 Toast 警告
@@ -244,15 +257,17 @@ SQLite 单文件数据库，按月分表。核心规则：
 
 ## 服务器 CLI 参数
 
-`server` 支持启动参数（`bin/server.rs`）：
+`account_server` 支持启动参数（`bin/account_server.rs`，解析逻辑为 `parse_args_from(&[String])` 便于单测）：
 
 | 参数 | 说明 | 默认值 |
 |---|---|---|
-| `--ip <地址>` | 监听 IP 地址 | `127.0.0.2`（端口固定 3000） |
-| `--db <路径>` | 数据库文件路径 | 与 server 可执行文件同目录下的 `account.db` |
+| `--ip <地址>` | 监听 IP 地址 | `127.0.0.2` |
+| `--port <端口>` | 监听端口（`1~65535`，`0` 视为非法） | `3000` |
+| `--db <路径>` | 数据库文件路径 | 与 account_server 同目录下的 `account.db` |
+| `--http-version <2\|3>` | HTTP 版本（**预留**：当前固定 HTTP/2.0，3 仅校验并 warn 提示） | `2` |
 | `-h, --help` | 显示帮助 | — |
 
-启动成功后输出 info 日志：监听地址（`https://IP:3000`）、API 版本、数据库版本、当前时间（**系统时区**，形如 `UTC+8 2026-10-31 12:34:56`；负偏移 `UTC-8`、半小时时区 `UTC+5:30`）。
+启动成功后输出 info 日志：监听地址（`https://IP:端口`，端口取实际参数）、API 版本、数据库版本、当前时间（**系统时区**，形如 `UTC+8 2026-10-31 12:34:56`；负偏移 `UTC-8`、半小时时区 `UTC+5:30`）。
 
 日志级别：debug 构建默认 `debug`，release 构建默认 `info`（仍可被 `RUST_LOG` 覆盖）。
 
@@ -260,11 +275,12 @@ SQLite 单文件数据库，按月分表。核心规则：
 
 跨页公用的代码保留在 `ui.rs`（父模块）；**每页 UI 分别存于 `ui/` 子目录**（类似 `db.rs` + `db/month.rs`）：
 
-- `ui.rs`：全局状态（`GlobalState`）、HTTP 封装（`http_put/http_post` 及绝对 URL 的 `http_get`）、平台差异封装（sleep/now_str/提示）、全局 CSS 重置（`GLOBAL_CSS`，`App` 注入 `style` 元素；清除浏览器默认的 `html/body` 8px `margin` 并统一 `box-sizing: border-box`）、`DayTimeInput`、`SearchSelect`（搜索+候选选择组件：输入框 `value` 只绑定用户输入、已选项用 `placeholder` 呈现；`Enter` 确认、`Escape`/失焦收起候选、候选用 `mousedown`+`prevent_default` 选择、`empty_label` 插入「全部」项）、`ConfirmDialog`、`MainLayout`、根 `App`
-- `ui/connect.rs`：连接页（含关闭服务器按钮）
-- `ui/records.rs`：交易记录浏览器（挂载时自动刷新；行格式：时间 转出→转入 金额 货币 备注 删除条目按钮 组名 删除组按钮；新建组行的转出/转入、顶部「对象」筛选均用 `SearchSelect` 搜索选择）
+- `ui.rs`：全局状态（`GlobalState`，含 `records_order` 排序方向）、跨 bin 会话缓存 `session`（`set_active/active_base/clear`，供桌面端退出时关后端）、HTTP 封装（`http_put/http_post` 及绝对 URL 的 `http_get`）、平台差异封装（sleep/now_str/提示）、全局 CSS 重置（`GLOBAL_CSS`，`App` 注入 `style` 元素并注入 `document::Link` 图标）、`SearchSelect`（搜索+候选选择组件：输入框 `value` 只绑定用户输入；**已选项用黑字叠加层展示、占位文本保持灰色**；`Enter` 确认、`Escape`/失焦收起候选、候选用 `mousedown`+`prevent_default` 选择、`empty_label` 插入「全部」项）、`parse_money`、`ConfirmDialog`、`MainLayout`、根 `App`
+- `ui/date.rs`：中文日期组件（`DatePicker` 可手输 `YYYY-MM-DD` + 日历面板、`TimePicker` 时/分默认 `0` 且可任意键入（失焦校验：`059`/`59.0`→`59`，非法→`0`）、`DayTimeInput` = 日期+时间、`MonthPicker` 可手输 `YYYY-MM` + 自定义年月面板（可「不限」）、`NumberField` 可手输数字输入；纯逻辑 `days_in_month`/`weekday_index_monday`/`shift_month`/`parse_date`/`format_date`/`split_datetime`/`parse_plain_number`/`normalize_number`/`step_number` 均有单测）
+- `ui/connect.rs`：连接页（五行布局；连接按钮兼任返回主页面；断开清缓存；关闭服务器走 `ConfirmDialog`）
+- `ui/records.rs`：交易记录浏览器（挂载时自动刷新；**`SortToggle` 切换 `SortOrder`（默认从新到旧）**，`sort_records` 纯函数可单测；行格式：时间 转出→转入 金额 货币 备注 删除条目按钮 组名 删除组按钮；新建组行的转出/转入、顶部「对象」筛选均用 `SearchSelect`）
 - `ui/master.rs`：交易对象/货币管理（货币、交易对象均有搜索栏，空搜索显示全部；灰白相间列表——交易对象为「名称左 / 金额右 / 货币类型右」，货币名称居中）
-- `ui/stats.rs`：数据统计（双栏交易对象选择：左可搜索列表点「添加」自动去重、右已选列表可「踢出」；结果卡片显示当前余额与逐月收入/支出/前端计算的结算余额；顶部提供「📤 导出交易记录」）
+- `ui/stats.rs`：数据统计（月份范围用 `MonthPicker`，可留空表示不限；双栏交易对象选择：左可搜索列表点「添加」自动去重、右已选列表可「踢出」；结果卡片显示当前余额与逐月收入/支出/前端计算的结算余额；顶部提供「📤 导出交易记录」）
 - `ui/export.rs`：导出（`ExportJob`/`ExportTarget` + `ExportSaveDialog` + `spawn_export`；`sheet_from_views` 把记录视图转成导出表；Web 用 `Blob`+`<a download>`，桌面用 `rfd::AsyncFileDialog` 选路径后 `std::fs::write`，均走 `run_blocking` 后台执行）
 - `ui/status_bar.rs`：底部状态栏（后端连接状态 + 详情浮层 / 更新检测按钮 / 提示信息 / 任务进度条）
 - `ui/update.rs`：更新检测（`spawn_check`/`resolve_state`/`UpdateState`/`repo_slug`/`parse_release`/`is_newer`）
@@ -298,24 +314,26 @@ SQLite 单文件数据库，按月分表。核心规则：
 ```bash
 cd account
 
-# 后端（native）带自定义参数
-cargo run --bin server                          # 默认 127.0.0.2:3000，db 与 exe 同目录
-cargo run --bin server -- --ip 127.0.0.1        # 指定监听 IP
-cargo run --bin server -- --db data/custom.db   # 指定数据库路径
-cargo run --bin server -- --help                # 查看帮助
+# 计算端（native）带自定义参数
+cargo run --bin account_server                            # 默认 127.0.0.2:3000，db 与 exe 同目录
+cargo run --bin account_server -- --ip 127.0.0.1          # 指定监听 IP
+cargo run --bin account_server -- --port 3001             # 指定监听端口
+cargo run --bin account_server -- --db data/custom.db     # 指定数据库路径
+cargo run --bin account_server -- --http-version 3        # 预留参数（当前仍用 HTTP/2.0）
+cargo run --bin account_server -- --help                  # 查看帮助
 
-cargo test --features client         # 运行单元测试（81 个，含 UI/导出/更新检测/时区）
+cargo test --features client         # 运行单元测试（含 UI/导出/日期组件/CLI 参数/时区）
 cargo clippy --all-targets --features client  # 静态检查
 
-# 打开调试日志（PowerShell：$env:RUST_LOG="debug"; cargo run --bin server）
-$env:RUST_LOG="debug"; cargo run --bin server
+# 打开调试日志（PowerShell：$env:RUST_LOG="debug"; cargo run --bin account_server）
+$env:RUST_LOG="debug"; cargo run --bin account_server
 
 # 前端（必须带 --features client）
-cargo check --target wasm32-unknown-unknown --bin client --features client   # wasm 类型检查
-cargo build --target wasm32-unknown-unknown --bin client --features client   # Web 构建
-dx build --release --platform web --bin client --features bundle,client   # Dioxus 打包（必须指明 bin=client）
-cargo run --bin client --features client             # 桌面客户端（native）
-dx bundle --release --platform desktop --bin client --features bundle,client  # 桌面安装包
+cargo check --target wasm32-unknown-unknown --bin account_client --features client   # wasm 类型检查
+cargo build --target wasm32-unknown-unknown --bin account_client --features client   # Web 构建
+dx build --release --platform web --bin account_client --features bundle,client   # Dioxus 打包（必须指明 bin=account_client）
+cargo run --bin account_client --features client             # 桌面客户端（native）
+dx bundle --release --platform desktop --bin account_client --features bundle,client  # 桌面安装包
 
 # 安装 dioxus-cli（指定版本）
 cargo install dioxus-cli --version 0.7.10
@@ -326,14 +344,19 @@ cargo install dioxus-cli --version 0.7.10
 - 推送 `main` 分支 → `.github/workflows/release.yml` 自动构建：
   计算端与桌面客户端（Windows x64 / Linux x64 / **macOS arm64**，Intel macOS 已停发）、Web 版（wasm）；
   桌面客户端为最小化包（`Dioxus.toml` 的 `webview_install_mode = "Skip"` 表示不自带 WebView2）
+- **Linux 计算端为完全静态二进制**：`x86_64-unknown-linux-musl` + `RUSTFLAGS="-C target-feature=+crt-static"`，
+  需 `musl-tools`（bundled SQLite 的 C 代码用 `musl-gcc` 编译）；作业内用 `readelf -d` 断言无 `NEEDED`，
+  产物不依赖 glibc 等系统动态库，可在各类 x86_64 发行版直接运行
 - Linux **客户端**作业需装 GTK/WebKit/xdo 开发库并断言 `pkg-config --modversion glib-2.0 / webkit2gtk-4.1 / libxdo`；
-  缺 `libxdo-dev` 会在链接期报 `rust-lld: unable to find library -lxdo`（`muda`/`wry` 依赖）
-- Linux **server** 作业无需任何 GUI 库：server 不启用 `client` 特性，依赖图中不含 dioxus/GTK/WebKit
+  缺 `libxdo-dev` 会在链接期报 `rust-lld: unable to find library -lxdo`（`muda`/`wry` 依赖）。
+  **客户端无法静态化**（WebKitGTK 必须由系统提供），仍为 glibc 动态链接 + deb/tar.gz
+- Linux **计算端**作业无需任何 GUI 库：account_server 不启用 `client` 特性，依赖图中不含 dioxus/GTK/WebKit
 - 工作流使用 Node 24 版 action（`checkout@v7` / `cache@v6` / `upload-artifact@v7` / `download-artifact@v8`），
   避免 Node 20 弃用告警
 - `meta` 作业从 `account/Cargo.toml` 读取 `version` 作为 **tag（不带 v 前缀）**；
   用 `git ls-remote --tags` 判断 tag 是否已存在，已存在则只构建不发版（幂等）
 - 发版由 `softprops/action-gh-release` 完成（需要 `permissions: contents: write`）
+- 产物命名：`account_server-<平台>.zip/.tar.gz`、`account_client-<平台>.zip/.tar.gz`、`account_web-wasm.zip`
 - 客户端「启动更新检测」读取 `releases/latest`，因此**首个 release 发布后该功能才会给出提示**
 - **`Cargo.toml` 的 `description` 必须为 ASCII**：`dx bundle` 生成的 NSIS / WiX 脚本使用 code page 1252，
   中文会导致 `makensis`（Bad text encoding）与 `light.exe`（LGHT0311）失败；中文说明写在 README 中

@@ -2,6 +2,7 @@
 //!
 //! 手动指定时间范围与交易对象过滤 → 拉取记录。
 //! 新建交易组：组名 + 多行记录表单。
+//! 「记录」标题右侧提供排序方向切换（默认从新到旧，可切为从旧到新）。
 //! 删除单条记录会弹出确认框并列出该记录内容；
 //! 删除整组仅确认组名（不逐一列出组内记录），确认后整组删除。
 
@@ -34,7 +35,9 @@ pub(crate) fn RecordsPage() -> Element {
                     "counterparty_id": if cpid.is_empty() { None } else { cpid.parse::<i64>().ok() },
                 });
                 match http_put(&b, "/api/records", Some(body)).await {
-                    Ok(v) => st.records.set(serde_json::from_value(v).unwrap_or_default()),
+                    Ok(v) => st
+                        .records
+                        .set(serde_json::from_value(v).unwrap_or_default()),
                     Err(e) => push_toast(&st, &format!("刷新记录失败: {e}")),
                 }
             });
@@ -43,7 +46,11 @@ pub(crate) fn RecordsPage() -> Element {
 
     let cp: Vec<Counterparty> = (st.counterparties)().clone();
     let currencies: Vec<Currency> = (st.currencies)().clone();
-    let views: Vec<RecordView> = (st.records)().clone();
+    // 展示用的记录副本按当前排序方向排列：不改动 st.records 缓存本身，
+    // 否则切换排序会污染下一次刷新的落库顺序
+    let mut views: Vec<RecordView> = (st.records)().clone();
+    let order = (st.records_order)();
+    sort_records(&mut views, order);
     let query_from = dt_local(&(st.query_from)());
     let query_to = dt_local(&(st.query_to)());
     let query_cp = (st.query_cp)();
@@ -192,7 +199,14 @@ pub(crate) fn RecordsPage() -> Element {
                 }
             }
 
-            h4 { "记录" }
+            // 记录标题 + 排序切换按钮（标题右侧）
+            div { style: "display:flex;align-items:center;gap:8px",
+                h4 { style: "margin:0", "记录" }
+                SortToggle {
+                    order,
+                    onchange: move |o: SortOrder| st.records_order.set(o),
+                }
+            }
             for rec in views {
                 RecordRow { rec: rec }
             }
@@ -209,7 +223,10 @@ fn GroupRecordRow(idx: usize) -> Element {
     let mut st = use_context::<GlobalState>();
     let cp: Vec<Counterparty> = (st.counterparties)().clone();
     let currencies: Vec<Currency> = (st.currencies)().clone();
-    let row = (st.group_drafts)().get(idx).cloned().unwrap_or_else(GroupDraftRow::new);
+    let row = (st.group_drafts)()
+        .get(idx)
+        .cloned()
+        .unwrap_or_else(GroupDraftRow::new);
     let currency_id = row.currency_id.to_string();
     let amount = row.amount.clone();
     let remark = row.remark.clone();
@@ -305,7 +322,10 @@ fn RecordRow(rec: RecordView) -> Element {
     let to = rec.to.clone();
     let amount_currency = format!("{} {}", rec.amount.to_decimal_string(), rec.currency);
     let remark = rec.remark.clone();
-    let group_label = rec.group_name.clone().unwrap_or_else(|| format!("组#{gid}"));
+    let group_label = rec
+        .group_name
+        .clone()
+        .unwrap_or_else(|| format!("组#{gid}"));
     // 组包含的月份（用于删除组时定位组实例；同 group_id 可跨月复用）
     let group_months = rec.group_months.clone();
     // 供删除回调闭包捕获的独立副本（move 闭包会消耗捕获得值）
@@ -404,5 +424,139 @@ fn RecordRow(rec: RecordView) -> Element {
                 });
             }
         }
+    }
+}
+
+// ---------- 记录排序 ----------
+
+/// 记录列表的排序方向
+///
+/// 默认 [`SortOrder::NewestFirst`]：交易记录页打开时最新的记录排在最上面。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SortOrder {
+    /// 从新到旧（最新在前）
+    NewestFirst,
+    /// 从旧到新（最旧在前）
+    OldestFirst,
+}
+
+impl SortOrder {
+    /// 切换方向
+    pub(crate) fn toggled(self) -> Self {
+        match self {
+            SortOrder::NewestFirst => SortOrder::OldestFirst,
+            SortOrder::OldestFirst => SortOrder::NewestFirst,
+        }
+    }
+
+    /// 供按钮 `title` 与提示使用的中文说明
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SortOrder::NewestFirst => "从新到旧",
+            SortOrder::OldestFirst => "从旧到新",
+        }
+    }
+}
+
+/// 按交易时间排序记录
+///
+/// `traded_at` 是补零的 ISO 字符串（`YYYY-MM-DDTHH:MM:SS`），字典序即时间序，
+/// 无需解析成时间类型；`sort_by` 为稳定排序，同一时刻的记录保持后端返回顺序。
+pub(crate) fn sort_records(records: &mut [RecordView], order: SortOrder) {
+    match order {
+        SortOrder::NewestFirst => records.sort_by(|a, b| b.traded_at.cmp(&a.traded_at)),
+        SortOrder::OldestFirst => records.sort_by(|a, b| a.traded_at.cmp(&b.traded_at)),
+    }
+}
+
+/// 排序方向切换按钮
+///
+/// 竖排两个三角箭头：**实心代表当前方向**。
+/// 从新到旧（最新在上）时向上实心；从旧到新（向下即越来越新）时向下实心。
+#[component]
+fn SortToggle(order: SortOrder, onchange: EventHandler<SortOrder>) -> Element {
+    let newest_first = order == SortOrder::NewestFirst;
+    let up = if newest_first { "▲" } else { "△" };
+    let down = if newest_first { "▽" } else { "▼" };
+
+    rsx! {
+        button {
+            title: "当前排序：{order.label()}（点击切换）",
+            style: "display:flex;flex-direction:column;align-items:center;line-height:11px;font-size:11px;padding:2px 6px;border:1px solid #ccc;border-radius:4px;background:#fff;cursor:pointer;color:#333",
+            onclick: move |_| onchange.call(order.toggled()),
+            span { "{up}" }
+            span { "{down}" }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RecordView, SortOrder, sort_records};
+    use crate::models::Money;
+
+    /// 构造一条仅关心交易时间的记录视图（其余字段取固定值）
+    fn rec(id: i64, traded_at: &str) -> RecordView {
+        RecordView {
+            id,
+            group_id: 1,
+            group_name: None,
+            group_months: None,
+            from: "支付宝".to_string(),
+            from_id: 1,
+            to: "微信钱包".to_string(),
+            to_id: 2,
+            amount: Money::from_int(100),
+            currency: "RMB".to_string(),
+            remark: None,
+            traded_at: traded_at.to_string(),
+        }
+    }
+
+    /// 验证默认「从新到旧」：最新时间排在最前；切换后变「从旧到新」
+    #[test]
+    fn sort_records_should_order_by_traded_at() {
+        let mut records = vec![
+            rec(1, "2026-11-02T08:00:00"),
+            rec(2, "2026-11-01T23:59:59"),
+            rec(3, "2026-11-03T00:00:00"),
+        ];
+
+        sort_records(&mut records, SortOrder::NewestFirst);
+        let ids: Vec<i64> = records.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![3, 1, 2], "从新到旧：最新在前");
+        // 不相等断言：反向排序的结果必须不同（防止实现忽略方向）
+        assert_ne!(ids, vec![2, 1, 3]);
+
+        sort_records(&mut records, SortOrder::OldestFirst);
+        let ids: Vec<i64> = records.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![2, 1, 3], "从旧到新：最旧在前");
+    }
+
+    /// 验证边界：空集合与非空集合都不应 panic；单元素集合保持原样
+    #[test]
+    fn sort_records_should_handle_empty_and_single() {
+        let mut empty: Vec<RecordView> = Vec::new();
+        sort_records(&mut empty, SortOrder::NewestFirst);
+        assert!(empty.is_empty());
+
+        let mut single = vec![rec(7, "2026-11-06T12:00:00")];
+        sort_records(&mut single, SortOrder::OldestFirst);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].id, 7);
+    }
+
+    /// 验证切换方向：两个方向互逆，且方向文案不同
+    #[test]
+    fn sort_order_toggle_should_be_involutive() {
+        assert_eq!(SortOrder::NewestFirst.toggled(), SortOrder::OldestFirst);
+        assert_eq!(
+            SortOrder::OldestFirst.toggled().toggled(),
+            SortOrder::OldestFirst
+        );
+        assert_ne!(
+            SortOrder::NewestFirst.label(),
+            SortOrder::OldestFirst.label()
+        );
     }
 }
