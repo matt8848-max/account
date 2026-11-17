@@ -234,16 +234,30 @@ pub fn now_str() -> String {
 pub fn apply_currency_rename(
     currencies: &mut [Currency],
     records: &mut [RecordView],
-    _stats: &mut [ObjectStatView],
+    stats: &mut [ObjectStatView],
     id: i64,
     new_name: &str,
 ) {
+    let old_name = currencies
+        .iter()
+        .find(|c| c.id == id)
+        .map(|c| c.name.clone());
     if let Some(c) = currencies.iter_mut().find(|c| c.id == id) {
         c.name = new_name.to_string();
     }
     for r in records.iter_mut() {
         if r.currency_id == id {
             r.currency = new_name.to_string();
+        }
+    }
+    // 统计接口只返回货币名，没有 currency_id：按旧名替换。
+    if let Some(old) = old_name {
+        for month in stats.iter_mut() {
+            for item in month.objects.iter_mut() {
+                if item.currency == old {
+                    item.currency = new_name.to_string();
+                }
+            }
         }
     }
 }
@@ -376,6 +390,7 @@ mod tests {
         apply_currency_rename(&mut currencies, &mut records, &mut stats, 1, "CNY");
         assert_eq!(currencies[0].name, "CNY");
         assert_eq!(records[0].currency, "CNY");
+        assert_eq!(stats[0].objects[0].currency, "CNY");
         // 不相等断言：旧名不能残留
         assert_ne!(records[0].currency, "RMB");
     }
