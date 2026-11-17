@@ -1,296 +1,554 @@
-//! 第二页：交易对象/货币管理
+//! 交易对象与货币管理页
 //!
-//! 货币与交易对象的增删；交易对象支持初始余额输入。
-//! 列表实时显示最新余额（增删记录后由全局状态自动刷新）；
-//! 必须增删成功才更新本地内存缓存。
+//! 货币/交易对象的增删改（重命名）与搜索；布局与旧版一致：
+//! 两个表单 + 两个列表。
 
-use super::{ConfirmDialog, GlobalState, http_post, parse_money, push_toast};
-use crate::models::{Counterparty, Currency};
-use dioxus::prelude::*;
+use super::app::{AccountApp, RenameTarget};
+use super::confirm::{self, ConfirmAction};
+use super::http;
+use super::state::{apply_counterparty_rename, apply_currency_rename};
+use crate::server::models::{Counterparty, Currency, Money};
+use gpui_kit::AppContext as _;
+use gpui_kit::component::{
+    ActiveTheme as _, Sizable as _, WindowExt as _,
+    button::{Button, ButtonVariants as _},
+    h_flex,
+    input::{Input, InputState},
+    v_flex,
+};
+use gpui_kit::{
+    Context, IntoElement, ParentElement as _, SharedString, Styled as _, Window, div, px,
+};
+use serde_json::json;
 
-#[component]
-pub(crate) fn MasterPage() -> Element {
-    let mut st = use_context::<GlobalState>();
-    let currencies: Vec<Currency> = (st.currencies)().clone();
-    let counterparties: Vec<Counterparty> = (st.counterparties)().clone();
-    let has_cur = !currencies.is_empty();
-    let has_cp = !counterparties.is_empty();
-    // 搜索词（空 → 显示全部，符合「没有内容时全显示」的要求）
-    let mut cur_search = use_signal(String::new);
-    let mut cp_search = use_signal(String::new);
+impl AccountApp {
+    /// 对象/货币管理页。
+    pub fn master_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity();
+        let cur_q = self.cur_search.read(cx).value().trim().to_lowercase();
+        let cp_q = self.cp_search.read(cx).value().trim().to_lowercase();
+        let currencies: Vec<_> = self
+            .currencies
+            .iter()
+            .filter(|c| cur_q.is_empty() || c.name.to_lowercase().contains(&cur_q))
+            .cloned()
+            .collect();
+        let cur_names: std::collections::HashMap<i64, String> = self
+            .currencies
+            .iter()
+            .map(|c| (c.id, c.name.clone()))
+            .collect();
+        let counterparties: Vec<_> = self
+            .counterparties
+            .iter()
+            .filter(|c| {
+                cp_q.is_empty()
+                    || c.name.to_lowercase().contains(&cp_q)
+                    || cur_names
+                        .get(&c.currency_id)
+                        .is_some_and(|n| n.to_lowercase().contains(&cp_q))
+            })
+            .cloned()
+            .collect();
 
-    // 货币列表过滤：按名称子串匹配，忽略大小写
-    let cq = (cur_search)().trim().to_lowercase();
-    let filtered_currencies: Vec<Currency> = currencies
-        .iter()
-        .filter(|c| cq.is_empty() || c.name.to_lowercase().contains(&cq))
-        .cloned()
-        .collect();
+        let add_currency = {
+            let entity = entity.clone();
+            Button::new("add-currency")
+                .primary()
+                .label("添加")
+                .on_click(move |_, _, cx| {
+                    entity.update(cx, |this, cx| this.add_currency(cx));
+                })
+        };
+        let add_cp = {
+            let entity = entity.clone();
+            Button::new("add-counterparty")
+                .primary()
+                .label("添加")
+                .on_click(move |_, _, cx| {
+                    entity.update(cx, |this, cx| this.add_counterparty(cx));
+                })
+        };
+        let cur_pick_label = self
+            .currencies
+            .iter()
+            .find(|c| c.id == self.new_cp_currency)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "选择货币".to_string());
+        let pick_currency = {
+            let entity = entity.clone();
+            Button::new("pick-new-cp-currency")
+                .small()
+                .label(cur_pick_label)
+                .on_click(move |_, window, cx| {
+                    entity.update(cx, |this, cx| this.pick_new_cp_currency(window, cx));
+                })
+        };
 
-    // 交易对象列表过滤：名称或货币类型子串匹配，忽略大小写
-    let cur_names: std::collections::HashMap<i64, String> =
-        currencies.iter().map(|c| (c.id, c.name.clone())).collect();
-    let pq = (cp_search)().trim().to_lowercase();
-    let filtered_counterparties: Vec<Counterparty> = counterparties
-        .iter()
-        .filter(|c| {
-            if pq.is_empty() {
-                return true;
-            }
-            if c.name.to_lowercase().contains(&pq) {
-                return true;
-            }
-            cur_names
-                .get(&c.currency_id)
-                .is_some_and(|n| n.to_lowercase().contains(&pq))
+        let currency_rows: Vec<gpui_kit::AnyElement> = currencies
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                self.currency_row(window, cx, c.clone(), i % 2 == 1)
+                    .into_any_element()
+            })
+            .collect();
+        let cp_rows: Vec<gpui_kit::AnyElement> = counterparties
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                self.counterparty_row(window, cx, c.clone(), i % 2 == 1)
+                    .into_any_element()
+            })
+            .collect();
+
+        v_flex()
+            .w_full()
+            .items_start()
+            .justify_start()
+            .gap_4()
+            .child(div().text_xl().child("交易对象与货币管理"))
+            .child(
+                v_flex()
+                    .gap_2()
+                    .p_2()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(px(6.))
+                    .child("添加货币")
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(div().w(px(220.)).child(Input::new(&self.new_currency_name)))
+                            .child(add_currency),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .p_2()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(px(6.))
+                    .child("添加交易对象")
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child("名称:")
+                            .child(div().w(px(220.)).child(Input::new(&self.new_cp_name)))
+                            .child("货币:")
+                            .child(pick_currency)
+                            .child("初始余额:")
+                            .child(div().w(px(160.)).child(Input::new(&self.new_cp_balance)))
+                            .child(add_cp),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_4()
+                    .items_start()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .gap_2()
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .rounded(px(6.))
+                            .p_2()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .justify_between()
+                                    .child("货币")
+                                    .child(format!(
+                                        "{} / {}",
+                                        currencies.len(),
+                                        self.currencies.len()
+                                    )),
+                            )
+                            .child(Input::new(&self.cur_search))
+                            .children(currency_rows),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .gap_2()
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .rounded(px(6.))
+                            .p_2()
+                            .child(h_flex().gap_2().justify_between().child("交易对象").child(
+                                format!("{} / {}", counterparties.len(), self.counterparties.len()),
+                            ))
+                            .child(Input::new(&self.cp_search))
+                            .children(cp_rows),
+                    ),
+            )
+    }
+
+    /// 添加货币。
+    pub fn add_currency(&mut self, cx: &mut Context<Self>) {
+        let base = self.base(cx);
+        let version = self.http_version;
+        let name = self.new_currency_name.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            self.push_toast(cx, "货币名称不能为空");
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    http::post(
+                        &base,
+                        "/api/currencies",
+                        Some(json!({ "name": name })),
+                        version,
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(v) => {
+                        let id = v["id"].as_i64().unwrap_or(0);
+                        let name = v["name"].as_str().unwrap_or("").to_string();
+                        this.currencies.push(Currency { id, name });
+                    }
+                    Err(e) => this.push_toast(cx, format!("添加货币失败: {e}")),
+                }
+                cx.notify();
+            })
+            .ok();
         })
-        .cloned()
-        .collect();
+        .detach();
+    }
 
-    rsx! {
-        div { style: "display:flex;flex-direction:column;gap:16px",
-            h3 { "交易对象与货币管理" }
-
-            div { style: "border:1px solid #eee;padding:8px;border-radius:4px",
-                strong { "添加货币" }
-                div { style: "display:flex;gap:8px;margin-top:6px",
-                    input {
-                        value: st.new_currency_name,
-                        placeholder: "货币名称，如 RMB",
-                        oninput: move |e| st.new_currency_name.set(e.value()),
-                    }
-                    button {
-                        onclick: move |_| {
-                            let mut st = st;
-                            let name = (st.new_currency_name)();
-                            spawn(async move {
-                                let b = (st.base)();
-                                let body = serde_json::json!({ "name": name.trim() });
-                                match http_post(&b, "/api/currencies", Some(body)).await {
-                                    Ok(v) => {
-                                        let id = v["id"].as_i64().unwrap_or(0);
-                                        let nm = name.trim().to_string();
-                                        st.currencies.write().push(Currency { id, name: nm });
-                                        st.new_currency_name.set("".into());
-                                    }
-                                    Err(e) => push_toast(&st, &format!("添加货币失败: {e}")),
-                                }
-                            });
-                        },
-                        "添加"
-                    }
-                }
+    /// 添加交易对象（含初始余额）。
+    pub fn add_counterparty(&mut self, cx: &mut Context<Self>) {
+        let base = self.base(cx);
+        let version = self.http_version;
+        let name = self.new_cp_name.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            self.push_toast(cx, "交易对象名称不能为空");
+            return;
+        }
+        if self.new_cp_currency == 0 {
+            self.push_toast(cx, "请选择货币");
+            return;
+        }
+        let balance_text = self.new_cp_balance.read(cx).value().trim().to_string();
+        let balance = match Money::from_string(&balance_text) {
+            Ok(m) => m,
+            Err(e) => {
+                self.push_toast(cx, format!("初始余额格式不正确: {e}"));
+                return;
             }
+        };
+        let currency_id = self.new_cp_currency;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    http::post(
+                        &base,
+                        "/api/counterparties",
+                        Some(json!({
+                            "name": name,
+                            "currency_id": currency_id,
+                            "balance": balance,
+                        })),
+                        version,
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(_) => this.refresh_counterparties(cx),
+                    Err(e) => this.push_toast(cx, format!("添加交易对象失败: {e}")),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
 
-            div { style: "border:1px solid #eee;padding:8px;border-radius:4px",
-                strong { "添加交易对象" }
-                div { style: "display:flex;gap:8px;margin-top:6px;flex-wrap:wrap;align-items:center",
-                    input {
-                        value: st.new_cp_name,
-                        placeholder: "名称，如 微信钱包",
-                        oninput: move |e| st.new_cp_name.set(e.value()),
-                    }
-                    select {
-                        value: st.new_cp_currency,
-                        onchange: move |e| st.new_cp_currency.set(e.value()),
-                        for c in currencies.iter() {
-                            option { value: "{c.id}", "{c.name}" }
+    /// 选择新交易对象的货币。
+    pub fn pick_new_cp_currency(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let currencies = self.currencies.clone();
+        let entity = cx.entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let mut list = v_flex().gap_1();
+            for currency in currencies.clone() {
+                let entity = entity.clone();
+                list = list.child(
+                    Button::new(SharedString::from(format!("new-cur-{}", currency.id)))
+                        .label(currency.name)
+                        .on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            entity.update(cx, |this, cx| {
+                                this.new_cp_currency = currency.id;
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+            dialog.title("选择货币").child(list)
+        });
+    }
+
+    /// 单条货币行（灰白相间）。
+    pub fn currency_row(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        currency: Currency,
+        striped: bool,
+    ) -> impl IntoElement {
+        let id = currency.id;
+        let name = currency.name.clone();
+        let editing = self.renaming == Some(RenameTarget::Currency(id));
+        if editing {
+            return self.rename_editor(window, cx);
+        }
+        let entity = cx.entity();
+        let bg = if striped {
+            cx.theme().muted
+        } else {
+            cx.theme().background
+        };
+        let rename = {
+            let entity = entity.clone();
+            let name = name.clone();
+            Button::new(SharedString::from(format!("rename-cur-{id}")))
+                .small()
+                .label("✎")
+                .on_click(move |_, window, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.start_rename(window, cx, RenameTarget::Currency(id), &name);
+                    });
+                })
+        };
+        let delete = {
+            let entity = entity.clone();
+            let name = name.clone();
+            Button::new(SharedString::from(format!("del-cur-{id}")))
+                .danger()
+                .small()
+                .label("✕")
+                .on_click(move |_, window, cx| {
+                    confirm::confirm(
+                        window,
+                        cx,
+                        entity.clone(),
+                        "确认删除该货币？",
+                        format!("将删除货币: {name}\n\n若货币仍被交易对象或记录引用，删除将失败。"),
+                        ConfirmAction::DeleteCurrency { id },
+                    );
+                })
+        };
+        h_flex()
+            .gap_2()
+            .items_center()
+            .justify_between()
+            .px_2()
+            .py_1()
+            .bg(bg)
+            .child(div().flex_1().child(name))
+            .child(rename)
+            .child(delete)
+            .into_any_element()
+    }
+
+    /// 单条交易对象行。
+    pub fn counterparty_row(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        cp: Counterparty,
+        striped: bool,
+    ) -> impl IntoElement {
+        let id = cp.id;
+        let name = cp.name.clone();
+        let balance = cp.balance.to_string();
+        let cur_name = self
+            .currencies
+            .iter()
+            .find(|c| c.id == cp.currency_id)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        let editing = self.renaming == Some(RenameTarget::Counterparty(id));
+        if editing {
+            return self.rename_editor(window, cx);
+        }
+        let entity = cx.entity();
+        let bg = if striped {
+            cx.theme().muted
+        } else {
+            cx.theme().background
+        };
+        let rename = {
+            let entity = entity.clone();
+            let name = name.clone();
+            Button::new(SharedString::from(format!("rename-cp-{id}")))
+                .small()
+                .label("✎")
+                .on_click(move |_, window, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.start_rename(window, cx, RenameTarget::Counterparty(id), &name);
+                    });
+                })
+        };
+        let delete = {
+            let entity = entity.clone();
+            let name = name.clone();
+            Button::new(SharedString::from(format!("del-cp-{id}")))
+                .danger()
+                .small()
+                .label("✕")
+                .on_click(move |_, window, cx| {
+                    confirm::confirm(
+                        window,
+                        cx,
+                        entity.clone(),
+                        "确认删除该交易对象？",
+                        format!("将删除交易对象: {name}\n\n若对象仍被记录引用，删除将失败。"),
+                        ConfirmAction::DeleteCounterparty { id },
+                    );
+                })
+        };
+        h_flex()
+            .gap_2()
+            .items_center()
+            .justify_between()
+            .px_2()
+            .py_1()
+            .bg(bg)
+            .child(div().flex_1().child(name))
+            .child(div().child(balance))
+            .child(
+                div()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(cur_name),
+            )
+            .child(rename)
+            .child(delete)
+            .into_any_element()
+    }
+
+    /// 进入内联重命名：创建输入框并记录目标。
+    pub fn start_rename(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        target: RenameTarget,
+        current: &str,
+    ) {
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
+        self.renaming = Some(target);
+        self.rename_input = Some(input);
+        cx.notify();
+    }
+
+    /// 内联重命名编辑器。
+    pub fn rename_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let _ = &window;
+        let Some(input) = self.rename_input.clone() else {
+            return div().into_any_element();
+        };
+        let entity = cx.entity();
+        let save = {
+            let entity = entity.clone();
+            Button::new("rename-save")
+                .primary()
+                .small()
+                .label("保存")
+                .on_click(move |_, window, cx| {
+                    entity.update(cx, |this, cx| this.save_rename(window, cx));
+                })
+        };
+        let cancel = {
+            let entity = entity.clone();
+            Button::new("rename-cancel")
+                .small()
+                .label("取消")
+                .on_click(move |_, _, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.renaming = None;
+                        this.rename_input = None;
+                        cx.notify();
+                    });
+                })
+        };
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(div().w(px(220.)).child(Input::new(&input)))
+            .child(save)
+            .child(cancel)
+            .into_any_element()
+    }
+
+    /// 提交重命名：调用后端并同步前端公共状态。
+    pub fn save_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = &window;
+        let Some(target) = self.renaming else {
+            return;
+        };
+        let Some(input) = self.rename_input.clone() else {
+            return;
+        };
+        let new_name = input.read(cx).value().trim().to_string();
+        if new_name.is_empty() {
+            self.push_toast(cx, "名称不能为空");
+            return;
+        }
+        let base = self.base(cx);
+        let version = self.http_version;
+        let id = match target {
+            RenameTarget::Currency(id) | RenameTarget::Counterparty(id) => id,
+        };
+        let path = match target {
+            RenameTarget::Currency(_) => "/api/currencies/rename",
+            RenameTarget::Counterparty(_) => "/api/counterparties/rename",
+        };
+        let body = json!({ "id": id, "name": new_name });
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { http::post(&base, path, Some(body), version) })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(_) => {
+                        match target {
+                            RenameTarget::Currency(id) => apply_currency_rename(
+                                &mut this.currencies,
+                                &mut this.records,
+                                &mut this.stats,
+                                id,
+                                &new_name,
+                            ),
+                            RenameTarget::Counterparty(id) => apply_counterparty_rename(
+                                &mut this.counterparties,
+                                &mut this.records,
+                                &mut this.stats,
+                                id,
+                                &new_name,
+                            ),
                         }
+                        this.renaming = None;
+                        this.rename_input = None;
+                        this.push_toast(cx, "已重命名");
                     }
-                    input {
-                        value: st.new_cp_balance,
-                        placeholder: "初始余额",
-                        oninput: move |e| st.new_cp_balance.set(e.value()),
-                    }
-                    button {
-                        onclick: move |_| {
-                            let mut st = st;
-                            let name = (st.new_cp_name)();
-                            let balance_text = (st.new_cp_balance)();
-                            let cur_id: i64 = (st.new_cp_currency)().trim().parse().unwrap_or(0);
-                            let balance = match parse_money(&balance_text) {
-                                Some(m) => m,
-                                None => {
-                                    push_toast(&st, "初始余额格式不正确，应为数字（如 100 或 100.50）");
-                                    return;
-                                }
-                            };
-                            spawn(async move {
-                                let b = (st.base)();
-                                let body = serde_json::json!({
-                                    "name": name.trim(),
-                                    "currency_id": cur_id,
-                                    "balance": {
-                                        "value": balance.value,
-                                        "divisor": balance.divisor,
-                                    },
-                                });
-                                match http_post(&b, "/api/counterparties", Some(body)).await {
-                                    Ok(v) => {
-                                        let id = v["id"].as_i64().unwrap_or(0);
-                                        let nm = name.trim().to_string();
-                                        st.counterparties.write().push(Counterparty {
-                                            id,
-                                            name: nm,
-                                            currency_id: cur_id,
-                                            balance,
-                                        });
-                                        st.new_cp_name.set("".into());
-                                        st.new_cp_balance.set("0".into());
-                                    }
-                                    Err(e) => push_toast(&st, &format!("添加对象失败: {e}")),
-                                }
-                            });
-                        },
-                        "添加"
-                    }
+                    Err(e) => this.push_toast(cx, format!("重命名失败: {e}")),
                 }
-            }
-
-            // 货币列表：搜索 + 灰白相间列表（名称居中）
-            div { style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap",
-                h4 { style: "margin:0", "货币列表" }
-                input {
-                    style: "width:220px",
-                    value: cur_search,
-                    placeholder: "搜索货币...",
-                    oninput: move |e| cur_search.set(e.value()),
-                }
-                span { style: "font-size:12px;color:#888", "{filtered_currencies.len()} / {currencies.len()}" }
-            }
-            div { style: "border:1px solid #ddd;border-radius:4px;overflow:hidden",
-                div { style: "display:grid;grid-template-columns:minmax(0,1fr) 48px;align-items:center;padding:4px 10px;background:#eef0f3;color:#666;font-size:12px",
-                    span { style: "text-align:center", "货币" }
-                    span { "" }
-                }
-                for (idx, c) in filtered_currencies.iter().cloned().enumerate() {
-                    CurrencyRow { c: c, striped: idx % 2 == 1 }
-                }
-                if filtered_currencies.is_empty() {
-                    div { style: "padding:8px 10px;color:#999",
-                        if has_cur { "无匹配货币" } else { "暂无货币" }
-                    }
-                }
-            }
-
-            // 交易对象列表：搜索 + 灰白相间三列（名称左 / 金额右 / 货币类型右）
-            div { style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap",
-                h4 { style: "margin:0", "交易对象列表" }
-                input {
-                    style: "width:240px",
-                    value: cp_search,
-                    placeholder: "搜索名称或货币类型...",
-                    oninput: move |e| cp_search.set(e.value()),
-                }
-                span { style: "font-size:12px;color:#888", "{filtered_counterparties.len()} / {counterparties.len()}" }
-            }
-            div { style: "border:1px solid #ddd;border-radius:4px;overflow:hidden",
-                div { style: "display:grid;grid-template-columns:minmax(0,1fr) 120px 100px 48px;gap:8px;align-items:center;padding:4px 10px;background:#eef0f3;color:#666;font-size:12px",
-                    span { "名称" }
-                    span { style: "text-align:right", "金额" }
-                    span { style: "text-align:right", "货币类型" }
-                    span { "" }
-                }
-                for (idx, c) in filtered_counterparties.iter().cloned().enumerate() {
-                    CounterpartyRow { c: c, striped: idx % 2 == 1 }
-                }
-                if filtered_counterparties.is_empty() {
-                    div { style: "padding:8px 10px;color:#999",
-                        if has_cp { "无匹配交易对象" } else { "暂无交易对象" }
-                    }
-                }
-            }
-
-        }
-    }
-}
-
-/// 单条货币行（灰白相间；名称居中）
-#[component]
-fn CurrencyRow(c: Currency, striped: bool) -> Element {
-    let st = use_context::<GlobalState>();
-    let cid = c.id;
-    let cname = c.name.clone();
-    // 删除确认弹窗开关
-    let mut pending_delete = use_signal(|| false);
-
-    rsx! {
-        div {
-            style: format!(
-                "display:grid;grid-template-columns:minmax(0,1fr) 48px;align-items:center;gap:8px;padding:5px 10px;border-bottom:1px solid #eee;background:{}",
-                if striped { "#f5f6f8" } else { "#fff" }
-            ),
-            span { style: "text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap", "{cname}" }
-            button {
-                onclick: move |_| pending_delete.set(true),
-                "✕"
-            }
-        }
-
-        ConfirmDialog {
-            open: pending_delete,
-            title: String::from("确认删除该货币？"),
-            message: format!("将删除货币: {cname}\n\n若货币仍被交易对象或记录引用，删除将失败。"),
-            on_confirm: move |_| {
-                let mut st = st;
-                spawn(async move {
-                    let b = (st.base)();
-                    let body = serde_json::json!({ "id": cid });
-                    match http_post(&b, "/api/currencies/delete", Some(body)).await {
-                        Ok(_) => st.currencies.write().retain(|x| x.id != cid),
-                        Err(e) => push_toast(&st, &format!("删除失败: {e}")),
-                    }
-                });
-            }
-        }
-    }
-}
-
-/// 单条交易对象行（灰白相间；名称左 / 金额右 / 货币类型右）
-#[component]
-fn CounterpartyRow(c: Counterparty, striped: bool) -> Element {
-    let st = use_context::<GlobalState>();
-    let cid = c.id;
-    let cname = c.name.clone();
-    let bal = c.balance.to_decimal_string();
-    let cur_name = (st.currencies)()
-        .iter()
-        .find(|x| x.id == c.currency_id)
-        .map(|x| x.name.clone())
-        .unwrap_or_else(|| format!("id={}", c.currency_id));
-    // 删除确认弹窗开关
-    let mut pending_delete = use_signal(|| false);
-
-    rsx! {
-        div {
-            style: format!(
-                "display:grid;grid-template-columns:minmax(0,1fr) 120px 100px 48px;gap:8px;align-items:center;padding:5px 10px;border-bottom:1px solid #eee;background:{}",
-                if striped { "#f5f6f8" } else { "#fff" }
-            ),
-            span { style: "text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap", "{cname}" }
-            span { style: "text-align:right;font-variant-numeric:tabular-nums", "{bal}" }
-            span { style: "text-align:right;color:#666;overflow:hidden;text-overflow:ellipsis;white-space:nowrap", "{cur_name}" }
-            button {
-                onclick: move |_| pending_delete.set(true),
-                "✕"
-            }
-        }
-
-        ConfirmDialog {
-            open: pending_delete,
-            title: String::from("确认删除该交易对象？"),
-            message: format!("将删除交易对象: {cname}\n\n若对象仍被记录引用，删除将失败。"),
-            on_confirm: move |_| {
-                let mut st = st;
-                spawn(async move {
-                    let b = (st.base)();
-                    let body = serde_json::json!({ "id": cid });
-                    match http_post(&b, "/api/counterparties/delete", Some(body)).await {
-                        Ok(_) => st.counterparties.write().retain(|x| x.id != cid),
-                        Err(e) => push_toast(&st, &format!("删除失败: {e}")),
-                    }
-                });
-            }
-        }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 }

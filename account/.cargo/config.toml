@@ -1,0 +1,5 @@
+# reqwest 的 HTTP/3 仍属于 unstable 特性，必须显式打开该 cfg 才能使用
+# `ClientBuilder::http3_prior_knowledge()`。CI 中若用环境变量覆盖 RUSTFLAGS，
+# 也要把 `--cfg reqwest_unstable` 一并带上（见 .github/workflows/release.yml）。
+[build]
+rustflags = ["--cfg", "reqwest_unstable"]

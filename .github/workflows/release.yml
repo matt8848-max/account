@@ -1,7 +1,7 @@
 name: Build & Release
 
-# 只对 main 分支构建发布：tag 由 account/Cargo.toml 的 version 自动生成（tag 就是版本号，不带 v 前缀）。
-# tag 已存在时只构建不重复发版（幂等），因此 main 上多次提交不会产生重复 release。
+# 仅对 main 分支构建发布：tag 用 account/Cargo.toml 的 version 自动生成
+# （tag 就是版本号，不带 v 前缀）。tag 已存在时只构建不重复发版（幂等）。
 on:
   push:
     branches: [main]
@@ -10,8 +10,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # 与本地开发使用的 dioxus-cli 保持一致
-  DX_VERSION: 0.7.10
+  # reqwest HTTP/3 仍属 unstable 特性，必须显式打开该 cfg
+  REQWEST_CFG: "--cfg reqwest_unstable"
 
 permissions:
   contents: write
@@ -62,15 +62,12 @@ jobs:
           - os: windows-latest
             asset: windows-x64
             arch: x86_64-pc-windows-msvc
-            rustflags: ""
-          # Linux 用 musl + crt-static 产出**完全静态**的二进制：
-          # 不依赖 glibc / libgcc 等系统动态库，可在各类 x86_64 发行版上直接运行
+            rustflags: "--cfg reqwest_unstable"
+          # Linux 用 musl + crt-static 产出完全静态二进制（不依赖 glibc）
           - os: ubuntu-latest
             asset: linux-x64
             arch: x86_64-unknown-linux-musl
-            rustflags: "-C target-feature=+crt-static"
-          # macOS 单独放在 server_macos 作业（见下文）：该作业允许失败，
-          # 避免 runner 不可用时阻断整条发布流程
+            rustflags: "--cfg reqwest_unstable -C target-feature=+crt-static"
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
@@ -88,8 +85,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
-      # 计算端不启用 client 特性 → 依赖图里没有 dioxus/GTK/WebKit，
-      # 因此 Linux 上无需安装任何 GUI 开发库
+      # 计算端不启用 client 特性 → 依赖图里没有 GPUI / GUI 库
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: account
@@ -106,7 +102,6 @@ jobs:
           set -euo pipefail
           bin="target/${{ matrix.arch }}/release/account_server"
           file "$bin"
-          # 完全静态的二进制没有任何 NEEDED 动态库依赖
           if readelf -d "$bin" | grep -q 'NEEDED'; then
             echo "产物仍依赖动态库：" >&2
             readelf -d "$bin" >&2
@@ -121,8 +116,6 @@ jobs:
           bin="account/target/${{ matrix.arch }}/release/account_server"
           if [ "${{ runner.os }}" = "Windows" ]; then
             bin="$bin.exe"
-          fi
-          if [ "${{ runner.os }}" = "Windows" ]; then
             powershell -Command "Compress-Archive -Path '$bin' -DestinationPath 'dist/account_server-${{ matrix.asset }}.zip' -Force"
           else
             tar -czf "dist/account_server-${{ matrix.asset }}.tar.gz" -C "$(dirname "$bin")" "$(basename "$bin")"
@@ -134,20 +127,16 @@ jobs:
           name: server-${{ matrix.asset }}
           path: dist/*
           if-no-files-found: error
-          # 重跑（re-run）时同名产物已存在，覆盖而非 409 冲突
           overwrite: true
 
-  # macOS 计算端（可选作业）
-  #
-  # 单独成作业并 `continue-on-error: true`：GitHub 托管的 macOS runner 若不可用
-  # （例如报 "The configuration 'macos-14-arm64-us-default' is not supported"），
-  # 本作业失败但不影响其它作业与发布；runner 恢复后产物会自动回到 Release。
-  # 若 `macos-latest` 解析到的镜像不可用，可换成 `macos-15` / `macos-14` 再试。
+  # macOS 计算端（可选作业；runner 不可用时不影响其它平台发布）
   server_macos:
     name: 计算端 macos-arm64（可选）
     needs: meta
     runs-on: macos-latest
     continue-on-error: true
+    env:
+      RUSTFLAGS: "--cfg reqwest_unstable"
     steps:
       - uses: actions/checkout@v7
 
@@ -187,62 +176,37 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: windows-latest, asset: windows-x64, package_type: nsis }
-          - { os: ubuntu-latest, asset: linux-x64, package_type: deb }
-          # macOS 单独放在 desktop_macos 作业（见下文）：允许失败，不阻断发布
+          - { os: windows-latest, asset: windows-x64 }
+          - { os: ubuntu-latest, asset: linux-x64 }
+    env:
+      RUSTFLAGS: "--cfg reqwest_unstable"
     steps:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # 使用系统自带 WebView（macOS WKWebView / Linux WebKitGTK），不打包浏览器内核。
-      # libxdo-dev 提供 -lxdo（muda/wry 在 Linux 上链接需要），缺它会报 "unable to find library -lxdo"。
-      - name: 安装 Linux 构建依赖（GLib / GTK / WebKitGTK / libxdo）
+      # GPUI 在 Linux 需要 Wayland/X11、fontconfig、Vulkan 等开发库
+      - name: 安装 Linux 构建依赖（GPUI）
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            pkg-config \
-            libglib2.0-dev \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
-            libsoup-3.0-dev \
-            libjavascriptcoregtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            libxdo-dev \
-            librsvg2-dev \
-            patchelf
-          # 早失败：确认 GUI 依赖已就位（glib/webkit 用 pkg-config，xdo 用运行时库检查）
-          pkg-config --modversion glib-2.0
-          pkg-config --modversion webkit2gtk-4.1
-          ldconfig -p | grep -q 'libxdo\.so'
+            pkg-config gcc g++ clang \
+            libfontconfig-dev libwayland-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libssl-dev libzstd-dev \
+            libwebkit2gtk-4.1-dev libasound2-dev \
+            vulkan-validationlayers libvulkan1
+          pkg-config --modversion fontconfig
+          pkg-config --modversion xkbcommon
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: account
 
-      - name: 缓存 dioxus-cli
-        id: dx-cache
-        uses: actions/cache@v6
-        with:
-          path: ~/.cargo/bin/dx*
-          key: dx-${{ env.DX_VERSION }}-${{ runner.os }}-${{ runner.arch }}
-
-      - name: 安装 dioxus-cli
-        if: steps.dx-cache.outputs.cache-hit != 'true'
-        run: cargo install dioxus-cli --version ${{ env.DX_VERSION }} --locked
-
-      # 最小化包：Dioxus.toml 已配置 webview_install_mode = "Skip"，
-      # Windows 不内嵌 WebView2 运行时，Linux/macOS 使用系统 WebView。
-      - name: 构建桌面客户端（裸二进制）
+      - name: 构建桌面客户端（release）
         working-directory: account
         run: cargo build --release --bin account_client --features client
-
-      - name: 生成安装包 / .app（打包器失败不影响发布，仍会附带裸二进制）
-        working-directory: account
-        continue-on-error: true
-        run: dx bundle --release --platform desktop --bin account_client --features bundle,client --package-types ${{ matrix.package_type }}
 
       - name: 归档客户端产物
         shell: bash
@@ -252,14 +216,9 @@ jobs:
           mkdir -p dist stage
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp account/target/release/account_client.exe stage/
-          else
-            cp account/target/release/account_client stage/
-          fi
-          # dx 打包产物：安装包（Windows .exe/.msi、Linux .deb）
-          find account/target/dx -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.deb' \) -exec cp {} stage/ \; 2>/dev/null || true
-          if [ "${{ runner.os }}" = "Windows" ]; then
             powershell -Command "Compress-Archive -Path 'stage/*' -DestinationPath 'dist/$name.zip' -Force"
           else
+            cp account/target/release/account_client stage/
             tar -czf "dist/$name.tar.gz" -C stage .
           fi
           ls -l dist
@@ -269,52 +228,37 @@ jobs:
           name: client-desktop-${{ matrix.asset }}
           path: dist/*
           if-no-files-found: error
-          # 重跑（re-run）时同名产物已存在，覆盖而非 409 冲突
           overwrite: true
 
-  # macOS 桌面客户端（可选作业，理由同 server_macos）
+  # macOS 桌面客户端（可选作业）
   desktop_macos:
     name: 桌面客户端 macos-arm64（可选）
     needs: meta
     runs-on: macos-latest
     continue-on-error: true
+    env:
+      RUSTFLAGS: "--cfg reqwest_unstable"
     steps:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: account
 
-      - name: 缓存 dioxus-cli
-        id: dx-cache
-        uses: actions/cache@v6
-        with:
-          path: ~/.cargo/bin/dx*
-          key: dx-${{ env.DX_VERSION }}-${{ runner.os }}-${{ runner.arch }}
-
-      - name: 安装 dioxus-cli
-        if: steps.dx-cache.outputs.cache-hit != 'true'
-        run: cargo install dioxus-cli --version ${{ env.DX_VERSION }} --locked
-
-      - name: 构建桌面客户端（裸二进制）
+      - name: 构建桌面客户端（release）
         working-directory: account
-        run: cargo build --release --bin account_client --features client
-
-      - name: 生成 .app（打包器失败不影响发布，仍会附带裸二进制）
-        working-directory: account
-        continue-on-error: true
-        # macOS 的默认打包产物即 .app，故不指定 --package-types
-        run: dx bundle --release --platform desktop --bin account_client --features bundle,client
+        run: cargo build --release --bin account_client --features client --target aarch64-apple-darwin
 
       - name: 归档客户端产物
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist stage
-          cp account/target/release/account_client stage/
-          find account/target/dx -maxdepth 7 -type d -name '*.app' -exec cp -R {} stage/ \; 2>/dev/null || true
+          cp account/target/aarch64-apple-darwin/release/account_client stage/
           tar -czf "dist/account_client-macos-arm64.tar.gz" -C stage .
           ls -l dist
 
@@ -325,64 +269,10 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
-  wasm:
-    name: Web 客户端 wasm
-    needs: meta
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: account
-
-      - name: 缓存 dioxus-cli
-        id: dx-cache
-        uses: actions/cache@v6
-        with:
-          path: ~/.cargo/bin/dx*
-          key: dx-${{ env.DX_VERSION }}-${{ runner.os }}-${{ runner.arch }}
-
-      - name: 安装 dioxus-cli
-        if: steps.dx-cache.outputs.cache-hit != 'true'
-        run: cargo install dioxus-cli --version ${{ env.DX_VERSION }} --locked
-
-      - name: 构建 Web 客户端
-        working-directory: account
-        run: dx build --release --platform web --bin account_client --features bundle,client
-
-      - name: 归档 Web 静态站点
-        shell: bash
-        run: |
-          set -euo pipefail
-          public_dir=$(find account/target/dx -type d -path '*/release/web/public' | head -n1)
-          if [ -z "$public_dir" ]; then
-            echo "未找到 web 构建输出目录 public" >&2
-            find account/target/dx -maxdepth 4 -type d | sort
-            exit 1
-          fi
-          mkdir -p dist
-          (cd "$public_dir" && zip -r "$GITHUB_WORKSPACE/dist/account_web-wasm.zip" .)
-          ls -l dist
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: client-web-wasm
-          path: dist/*
-          if-no-files-found: error
-          overwrite: true
-
   release:
     name: 发布 Release（tag = Cargo 版本号）
-    # macOS 为可选作业（runner 不可用时失败），这里一并等待其结束，
-    # 但只有必需作业（Windows/Linux 计算端、桌面客户端、Web）成功才发布，
-    # 避免因可选作业失败而跳过发布、或因必需作业失败而发出残缺的发布
-    needs: [meta, server, desktop, wasm, server_macos, desktop_macos]
-    if: ${{ !cancelled() && needs.meta.outputs.tag_exists == 'false' && needs.server.result == 'success' && needs.desktop.result == 'success' && needs.wasm.result == 'success' }}
+    needs: [meta, server, desktop, server_macos, desktop_macos]
+    if: ${{ !cancelled() && needs.meta.outputs.tag_exists == 'false' && needs.server.result == 'success' && needs.desktop.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
@@ -392,7 +282,7 @@ jobs:
       - name: 列出待发布文件
         run: find artifacts -type f | sort
 
-      - name: 创建 Release 并上传三端产物
+      - name: 创建 Release 并上传产物
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.meta.outputs.version }}
