@@ -1,0 +1,33 @@
+{
+  "version": 2,
+  "skills": {
+    "gpui-kit": {
+      "source": "longbridge/gpui-kit",
+      "commit": "5e79668b70e6f2c201ef899794517e61ae7b1d08",
+      "sourceType": "github",
+      "skillPath": "skills/gpui-kit/SKILL.md",
+      "computedHash": "f7b8b0e4a1f70e649a38720c04374a5a4bd597ba9cd6e2bc7bb5c83504ed4812"
+    },
+    "gpui-kit-design-guides": {
+      "source": "longbridge/gpui-kit",
+      "commit": "5e79668b70e6f2c201ef899794517e61ae7b1d08",
+      "sourceType": "github",
+      "skillPath": "skills/gpui-kit-design-guides/SKILL.md",
+      "computedHash": "20d2e41da0baab7881683869cec2ddeea6fb01ce429a84eb6de968883d53e7ca"
+    },
+    "rust-best-practices": {
+      "source": "apollographql/skills",
+      "commit": "9dda1397730370aeb8df4ff8f2015c34c86b5003",
+      "sourceType": "github",
+      "skillPath": "skills/rust-best-practices/SKILL.md",
+      "computedHash": "7e12e68aa50152eb7ba9ea1f88ca5380c846ea0175f8ab6788bb79b7faf12ca0"
+    },
+    "sqlite-best-practices": {
+      "source": "erayack/sqlite-best-practices",
+      "commit": "0385ab90416b4ed6bb80bbfad69befc49114c29b",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "e13873b3fcd97a7d7eda37d5308f8aeffafa23ad3110f7011a61b4ffc5e8646a"
+    }
+  }
+}

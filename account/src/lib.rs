@@ -1,20 +1,14 @@
 //! 记账软件共享库
 //!
-//! - `models` — 数据模型（server 与 client 共用，纯 serde）
-//! - `export` — xlsx 导出（纯逻辑，server/client 均可复用，不触碰文件系统）
-//! - `ui` — 客户端界面（Dioxus，native + wasm，仅 `client` 特性下编译）
-//! - `db` — SQLite 数据访问层（仅 native 编译）
-//! - `api` — HTTP API 实现（仅 native 编译）
+//! 模块分层（与 `ui.rs` / `server.rs` 的“父模块只注册”约定一致）：
+//! - [`server`] — 后端与前后端共用代码（Money、数据模型、xlsx 导出、API、DB）
+//! - [`ui`]     — 桌面客户端（GPUI，仅 `client` 特性下编译）
+//!
+//! 共用代码放在 `server/` 下，客户端直接复用，避免前后端各写一份逻辑。
 
-pub mod export;
-pub mod models;
+pub mod server;
 
-/// 客户端 UI：依赖 dioxus / rfd / web-sys 等，server 不启用该特性，
-/// 从而 Linux 上编译与运行 server 都不需要 GTK / WebKitGTK。
+/// 客户端 UI：依赖 gpui-kit / rfd，server 不启用该特性，
+/// 从而编译 `account_server` 时不会触碰任何 GUI 依赖。
 #[cfg(feature = "client")]
 pub mod ui;
-
-#[cfg(not(target_arch = "wasm32"))]
-pub mod api;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod db;

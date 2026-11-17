@@ -14,8 +14,8 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
-    use account::api::{self, AppState};
-    use account::db;
+    use account::server::api::{self, AppState};
+    use account::server::db;
     use anyhow::{Context, Result};
     use axum_server::tls_rustls::RustlsConfig;
     use rcgen::{CertificateParams, KeyPair};
@@ -29,8 +29,10 @@ mod imp {
     const DEFAULT_IP: &str = "127.0.0.2";
     /// 默认端口
     const DEFAULT_PORT: u16 = 3000;
-    /// 支持的 HTTP 版本（预留：当前只实现 HTTP/2.0，3 为后续 HTTP/3 的占位）
+    /// 支持的 HTTP 版本：2 = TCP + TLS（axum-server），3 = UDP + QUIC（h3）
     const HTTP_VERSIONS: [u8; 2] = [2, 3];
+    /// HTTP/3 的 TLS ALPN 标识
+    const H3_ALPN: &[u8] = b"h3";
     /// 证书文件路径
     const CERT_PEM: &str = "certs/cert.pem";
     const KEY_PEM: &str = "certs/key.pem";
@@ -146,7 +148,7 @@ mod imp {
         println!(
             "    --db <路径>             数据库文件路径（默认与程序同目录下的 {DB_FILE_NAME}）"
         );
-        println!("    --http-version <2|3>    HTTP 版本（预留，当前固定使用 HTTP/2.0）");
+        println!("    --http-version <2|3>    HTTP 版本（2=HTTPS/HTTP2，3=QUIC/HTTP3，默认 2）");
         println!("    -h, --help              显示帮助");
     }
 
@@ -182,6 +184,11 @@ mod imp {
     }
 
     pub async fn run() -> Result<()> {
+        // 统一 rustls 加密提供者（ring）：HTTP/2（axum-server）与 HTTP/3（quinn）
+        // 必须使用同一个进程级默认提供者，否则 `ServerConfig::builder()` 会 panic。
+        // 已安装过时返回 Err，忽略即可。
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         let Some(cli) = parse_args()? else {
             return Ok(());
         };
@@ -192,53 +199,156 @@ mod imp {
         let db_ver = db::db_version(&conn)?;
         log::info!("数据库已就绪: {}", cli.db.display());
 
-        // 准备 TLS 证书（不存在则自动生成自签名证书）
-        let tls_config = ensure_tls_config().await.context("准备 TLS 证书失败")?;
-
-        // 预留关闭句柄，供 POST /api/close 优雅关闭
-        let shutdown_handle = axum_server::Handle::new();
-        let state = AppState {
-            conn: Arc::new(Mutex::new(conn)),
-            shutdown: shutdown_handle.clone(),
-        };
-        let app = api::router(state);
+        // 准备 TLS 证书（不存在则自动生成自签名证书），返回 PEM 字节：
+        // HTTP/2 交给 axum-server，HTTP/3 交给 quinn/rustls。
+        let (cert_pem, key_pem) = ensure_cert_files().await.context("准备 TLS 证书失败")?;
 
         let addr: SocketAddr = format!("{}:{}", cli.ip, cli.port)
             .parse()
             .with_context(|| format!("无效监听地址: {}:{}", cli.ip, cli.port))?;
 
-        // `--http-version` 目前只是预留：3 尚未实现，这里显式提示，避免用户误以为已生效
-        if cli.http_version != 2 {
-            log::warn!(
-                "--http-version {} 为预留参数（HTTP/3 尚未实现），本次仍使用 HTTP/2.0",
-                cli.http_version
-            );
-        }
-        log::info!("记账计算端启动: https://{addr} (HTTP/2.0)");
+        log::info!("记账计算端启动: {} (HTTP/{})", addr, cli.http_version);
         log::info!("API 版本: {}", api::API_VERSION);
         log::info!("数据库版本: {db_ver}");
         log::info!("当前时间: {}", now_local());
 
+        match cli.http_version {
+            3 => serve_http3(conn, addr, &cert_pem, &key_pem).await,
+            _ => serve_http2(conn, addr, &cert_pem, &key_pem).await,
+        }
+    }
+
+    /// HTTP/2（TLS + axum-server）
+    async fn serve_http2(
+        conn: rusqlite::Connection,
+        addr: SocketAddr,
+        cert_pem: &[u8],
+        key_pem: &[u8],
+    ) -> Result<()> {
+        let tls_config = RustlsConfig::from_pem(cert_pem.to_vec(), key_pem.to_vec())
+            .await
+            .context("构建 HTTP/2 TLS 配置失败")?;
+
+        let shutdown_handle = axum_server::Handle::new();
+        let state = AppState {
+            conn: Arc::new(Mutex::new(conn)),
+            shutdown: api::Shutdown::for_http2(shutdown_handle.clone()),
+        };
+        let app = api::router(state);
+
+        log::info!("监听 https://{addr}（HTTP/2）");
         axum_server::bind_rustls(addr, tls_config)
             .handle(shutdown_handle)
             .serve(app.into_make_service())
             .await
-            .context("服务器运行失败")?;
+            .context("HTTP/2 服务器运行失败")?;
         log::info!("服务器已关闭");
         Ok(())
     }
 
-    /// 准备 TLS 配置：加载或生成自签名证书
-    async fn ensure_tls_config() -> Result<RustlsConfig> {
+    /// HTTP/3（QUIC + h3 + h3-axum）
+    async fn serve_http3(
+        conn: rusqlite::Connection,
+        addr: SocketAddr,
+        cert_pem: &[u8],
+        key_pem: &[u8],
+    ) -> Result<()> {
+        let state = AppState {
+            conn: Arc::new(Mutex::new(conn)),
+            shutdown: api::Shutdown::for_http3(),
+        };
+        let shutdown = state.shutdown.clone();
+        let app = api::router(state);
+
+        let server_config = build_quic_server_config(cert_pem, key_pem)?;
+        let endpoint = quinn::Endpoint::server(server_config, addr)
+            .with_context(|| format!("QUIC 监听失败: {addr}"))?;
+
+        log::info!("监听 udp://{addr}（HTTP/3 / QUIC）");
+        loop {
+            tokio::select! {
+                _ = shutdown.wait() => {
+                    log::info!("收到关闭请求，停止 QUIC 监听");
+                    endpoint.close(0u32.into(), b"shutdown");
+                    break;
+                }
+                incoming = endpoint.accept() => {
+                    let Some(incoming) = incoming else { break };
+                    let app = app.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_h3_connection(incoming, app).await {
+                            log::warn!("HTTP/3 连接异常: {e:#}");
+                        }
+                    });
+                }
+            }
+        }
+        log::info!("服务器已关闭");
+        Ok(())
+    }
+
+    /// 处理一条 QUIC 连接：逐条接受 H3 请求并交给 axum Router。
+    async fn handle_h3_connection(incoming: quinn::Incoming, app: axum::Router) -> Result<()> {
+        let conn = incoming.await.context("QUIC 握手失败")?;
+        let h3_conn = h3_quinn::Connection::new(conn);
+        let mut h3 = h3::server::builder()
+            .build::<_, bytes::Bytes>(h3_conn)
+            .await
+            .context("建立 H3 连接失败")?;
+
+        loop {
+            match h3.accept().await {
+                Ok(Some(resolver)) => {
+                    if let Err(e) = h3_axum::serve_h3_with_axum(app.clone(), resolver).await {
+                        log::warn!("H3 请求处理失败: {e}");
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    if h3_axum::is_graceful_h3_close(&e) {
+                        break;
+                    }
+                    return Err(anyhow::anyhow!("H3 连接错误: {e}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 构建 QUIC 的 rustls 配置（ALPN 固定为 `h3`）。
+    fn build_quic_server_config(cert_pem: &[u8], key_pem: &[u8]) -> Result<quinn::ServerConfig> {
+        use std::io::Cursor;
+
+        let certs = rustls_pemfile::certs(&mut Cursor::new(cert_pem))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("解析证书失败")?;
+        let key = rustls_pemfile::private_key(&mut Cursor::new(key_pem))
+            .context("解析私钥失败")?
+            .ok_or_else(|| anyhow::anyhow!("证书文件缺少私钥"))?;
+
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .context("构建 H3 TLS 配置失败")?;
+        tls.alpn_protocols = vec![H3_ALPN.to_vec()];
+
+        let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
+            .context("构建 QUIC 加密配置失败")?;
+        Ok(quinn::ServerConfig::with_crypto(Arc::new(quic)))
+    }
+
+    /// 准备 TLS 证书文件：存在则读取，否则生成自签名证书并写盘。
+    ///
+    /// 返回 `(cert_pem, key_pem)` 字节，供 HTTP/2 与 HTTP/3 共用。
+    async fn ensure_cert_files() -> Result<(Vec<u8>, Vec<u8>)> {
         if Path::new(CERT_PEM).exists() && Path::new(KEY_PEM).exists() {
             log::info!("加载已有证书: {CERT_PEM}");
-            return RustlsConfig::from_pem_file(CERT_PEM, KEY_PEM)
-                .await
-                .context("读取证书失败");
+            let cert = std::fs::read(CERT_PEM).context("读取证书失败")?;
+            let key = std::fs::read(KEY_PEM).context("读取私钥失败")?;
+            return Ok((cert, key));
         }
-        log::info!("生成自签名证书用于 HTTPS/HTTP2...");
+        log::info!("生成自签名证书（HTTPS / QUIC 共用）...");
 
-        // 生成自签名证书
         let key_pair = KeyPair::generate().context("生成密钥失败")?;
         let mut params =
             CertificateParams::new(vec!["127.0.0.2".to_string(), "localhost".to_string()])
@@ -246,17 +356,13 @@ mod imp {
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let cert = params.self_signed(&key_pair).context("生成自签证书失败")?;
 
-        // 写入文件
-        let cert_pem = cert.pem();
-        let key_pem = key_pair.serialize_pem();
+        let cert_pem = cert.pem().into_bytes();
+        let key_pem = key_pair.serialize_pem().into_bytes();
         std::fs::create_dir_all("certs").context("创建 certs 目录失败")?;
-        std::fs::write(CERT_PEM, cert_pem).context("写入证书文件失败")?;
-        std::fs::write(KEY_PEM, key_pem).context("写入密钥文件失败")?;
+        std::fs::write(CERT_PEM, &cert_pem).context("写入证书文件失败")?;
+        std::fs::write(KEY_PEM, &key_pem).context("写入密钥文件失败")?;
         log::info!("自签名证书生成: {CERT_PEM}（客户端需信任该证书）");
-
-        RustlsConfig::from_pem_file(CERT_PEM, KEY_PEM)
-            .await
-            .context("加载生成的证书失败")
+        Ok((cert_pem, key_pem))
     }
 
     #[cfg(test)]

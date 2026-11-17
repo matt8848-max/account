@@ -1,148 +1,181 @@
 //! 底部状态栏
 //!
-//! 一行固定高度承载三类信息（取代原顶部黑色 Toast 浮层）：
-//! - **后端连接状态**：只显示「存活 / 失联」（有颜色），点击在上方展开详情浮层；
-//!   浮层用绝对定位，**不改变底栏高度**，因此不会挤动页面内容。
-//!   关闭方式：再点一次状态按钮，或点击浮层之外的任意位置（透明遮罩层）。
-//! - **更新检测**：有新版（红，点击打开发布页）/ 已最新（绿，点击重测）/ 失败（灰，点击重测）
-//! - **提示信息 + 长任务进度**：提示来自 `push_toast`，进度来自 `GlobalState.task`
-//!
-//! 三类组件都只占一行：详情浮层向上弹出，进度条为细横条，避免布局跳动。
+//! 一行固定 26px，承载：
+//! - 后端存活/失联（点击展开详情）
+//! - 更新检测状态（点击打开/重试）
+//! - 提示信息 + 长任务进度条
 
+use super::app::AccountApp;
+use super::state::TaskProgress;
 use super::update::{self, UpdateState};
-use super::{GlobalState, LIVE_INTERVAL_MS, open_external, push_toast};
-use dioxus::prelude::*;
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Sizable as _,
+    button::{Button, ButtonVariants as _},
+    h_flex,
+};
+use gpui_kit::{Context, IntoElement, ParentElement as _, Styled as _, Window, div, px};
 
-/// 后端状态在底栏的展示（圆点、文案、颜色）
-fn backend_badge(ok: bool) -> (&'static str, &'static str, &'static str) {
-    if ok {
-        ("●", "存活", "#2e7d32")
-    } else {
-        ("○", "失联", "#c0392b")
-    }
-}
+impl AccountApp {
+    /// 状态栏渲染。
+    pub fn status_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _ = &window;
+        let entity = cx.entity();
+        let alive = self.live_ok;
+        let (dot, text) = if alive {
+            ("●", "存活")
+        } else {
+            ("○", "失联")
+        };
+        let color = if alive {
+            cx.theme().success
+        } else {
+            gpui_kit::hsla(0.0, 0.7, 0.4, 1.0)
+        };
+        let detail_open = self.detail_open;
+        let base = self.base(cx);
+        let api_version = self.api_version.clone();
+        let live_at = self.live_at.clone();
+        let update_state = self.update_state.clone();
+        let show_update = !matches!(update_state, UpdateState::Idle);
+        let toast = self.toast.clone();
+        let task = self.task.clone();
 
-#[component]
-pub(crate) fn StatusBar() -> Element {
-    let st = use_context::<GlobalState>();
-    // 后端详情浮层开关（默认收起）
-    let show_detail = use_signal(|| false);
+        let backend_button = {
+            let entity = entity.clone();
+            Button::new("backend-status")
+                .ghost()
+                .xsmall()
+                .label(format!("后端：{dot} {text}"))
+                .text_color(color)
+                .on_click(move |_, _, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.detail_open = !this.detail_open;
+                        cx.notify();
+                    });
+                })
+        };
 
-    let live_ok = (st.live_ok)();
-    let (live_dot, live_text, live_color) = backend_badge(live_ok);
-    let detail_open = (show_detail)();
-    let base = (st.base)();
-    let api_version = (st.api_version)();
-    let live_at = (st.live_at)();
-
-    let update_state = (st.update_state)();
-    let update_text = update_state.label();
-    let update_color = update_state.color();
-    let update_title = update_state.title();
-    let update_clickable = update_state.is_clickable();
-    let update_cursor = if update_clickable {
-        "pointer"
-    } else {
-        "default"
-    };
-    // 未配置仓库（Idle）时整块隐藏，避免出现无意义的空按钮
-    let show_update = !matches!(update_state, UpdateState::Idle);
-
-    let toast_msg = (st.toast)();
-    let task = (st.task)();
-    // 自动探测间隔（分钟），用于详情浮层展示
-    let probe_minutes = LIVE_INTERVAL_MS / 60_000;
-
-    rsx! {
-        div {
-            style: "position:relative;display:flex;align-items:center;gap:14px;height:26px;padding:0 10px;border-top:1px solid #ddd;background:#f7f7f7;font-size:12px;color:#555;flex-shrink:0",
-
-            // 后端连接状态：点击展开详情
-            button {
-                style: "background:none;border:none;padding:0;cursor:pointer;font-size:12px;color:{live_color};white-space:nowrap",
-                onclick: move |_| {
-                    let mut show_detail = show_detail;
-                    show_detail.toggle();
-                },
-                "后端：{live_dot} {live_text}"
-            }
-
-            // 详情浮层：绝对定位于底栏上方，不占用布局高度
-            if detail_open {
-                // 点击面板之外的任意位置即关闭：铺满视口的透明遮罩，
-                // 层高低于浮层（1400 < 1500），因此点浮层内部不会触发关闭
-                div {
-                    style: "position:fixed;inset:0;z-index:1400;background:transparent",
-                    onclick: move |_| {
-                        // 与上方按钮的写法保持一致：Signal 的 set 需要可变绑定
-                        let mut show_detail = show_detail;
-                        show_detail.set(false);
-                    },
-                }
-                div {
-                    style: "position:absolute;left:8px;bottom:100%;margin-bottom:4px;background:#fff;border:1px solid #ddd;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,0.15);padding:10px 12px;min-width:300px;z-index:1500;display:flex;flex-direction:column;gap:6px;color:#333",
-                    div { style: "font-weight:600", "后端连接详情" }
-                    div { "地址：{base}" }
-                    div { "版本：{api_version}" }
-                    div { "状态：{live_text}（上次探测 {live_at}）" }
-                    div { "自动探测间隔：{probe_minutes} 分钟" }
-                }
-            }
-
-            // 更新检测：无展开，点击行为随状态变化
-            if show_update {
-                button {
-                    style: "background:none;border:none;padding:0;cursor:{update_cursor};font-size:12px;color:{update_color};white-space:nowrap",
-                    disabled: !update_clickable,
-                    title: "{update_title}",
-                    onclick: move |_| {
-                        let st = st;
-                        match (st.update_state)() {
-                            // 有新版本：打开发布页（桌面用系统浏览器，wasm 新标签页）
+        let update_button = if show_update {
+            let entity = entity.clone();
+            let state_for_click = update_state.clone();
+            let label = update_state.label();
+            let clickable = update_state.is_clickable();
+            let color = match &update_state {
+                UpdateState::Available { .. } => gpui_kit::hsla(0.0, 0.7, 0.4, 1.0),
+                UpdateState::Latest { .. } => cx.theme().success,
+                _ => cx.theme().muted_foreground,
+            };
+            Some(
+                Button::new("update-status")
+                    .ghost()
+                    .xsmall()
+                    .disabled(!clickable)
+                    .label(label)
+                    .text_color(color)
+                    .on_click(move |_, _, cx| {
+                        entity.update(cx, |this, cx| match &state_for_click {
                             UpdateState::Available { page, .. } => {
-                                if let Err(e) = open_external(&page) {
-                                    push_toast(&st, &e);
+                                if let Err(e) = update::open_external(page) {
+                                    this.push_toast(cx, e);
                                 }
                             }
-                            // 已最新 / 失败：重新检测
                             UpdateState::Latest { .. } | UpdateState::Failed { .. } => {
-                                update::spawn_check(st);
+                                this.spawn_update_check(cx);
                             }
-                            UpdateState::Idle | UpdateState::Checking => {}
-                        }
-                    },
-                    "{update_text}"
-                }
-            }
+                            _ => {}
+                        });
+                    }),
+            )
+        } else {
+            None
+        };
 
-            // 提示信息 + 长任务进度
-            div { style: "display:flex;align-items:center;gap:8px;flex:1;min-width:0",
-                if let Some(t) = &task {
-                    span { style: "color:#555;white-space:nowrap", "{t.describe()}" }
-                    div { style: "width:120px;height:8px;background:#e0e0e0;border-radius:4px;overflow:hidden;flex-shrink:0",
-                        div { style: "height:100%;width:{t.percent()}%;background:#3498db;transition:width 0.2s" }
-                    }
-                }
-                if let Some(msg) = &toast_msg {
-                    div {
-                        style: "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#333",
-                        title: "{msg}",
-                        "{msg}"
-                    }
-                }
-            }
-        }
+        let detail = if detail_open {
+            Some(
+                div()
+                    .absolute()
+                    .left(px(8.))
+                    .bottom(px(26.))
+                    .p_2()
+                    .gap_1()
+                    .flex()
+                    .flex_col()
+                    .min_w(px(300.))
+                    .bg(cx.theme().background)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(px(6.))
+                    .text_sm()
+                    .child(
+                        div()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .child("后端连接详情"),
+                    )
+                    .child(format!("地址：{base}"))
+                    .child(format!("版本：{api_version}"))
+                    .child(format!("状态：{text}（上次探测 {live_at}）"))
+                    .child("自动探测间隔：5 分钟"),
+            )
+        } else {
+            None
+        };
+
+        let progress = task.as_ref().map(|t| {
+            (
+                div().text_xs().child(t.describe()),
+                div()
+                    .w(px(120.))
+                    .h(px(8.))
+                    .rounded(px(4.))
+                    .bg(cx.theme().border)
+                    .child(
+                        div()
+                            .h_full()
+                            .w(px(AccountApp::progress_width(t, 120.)))
+                            .bg(cx.theme().primary)
+                            .rounded(px(4.)),
+                    ),
+            )
+        });
+
+        h_flex()
+            .relative()
+            .h(px(26.))
+            .flex_shrink_0()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().muted)
+            .text_xs()
+            .child(backend_button)
+            .children(update_button)
+            .children(detail)
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_2()
+                    .items_center()
+                    .children(progress.map(|(label, bar)| {
+                        h_flex().gap_2().items_center().child(label).child(bar)
+                    }))
+                    .child(if let Some(msg) = toast {
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(msg)
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    }),
+            )
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::backend_badge;
-
-    /// 验证后端状态的底栏展示：存活为绿色实心圆，失联为红色空心圆
-    #[test]
-    fn backend_badge_should_map_alive_and_lost() {
-        assert_eq!(backend_badge(true), ("●", "存活", "#2e7d32"));
-        assert_eq!(backend_badge(false), ("○", "失联", "#c0392b"));
+    /// 把任务百分比换算为像素宽度。
+    pub fn progress_width(task: &TaskProgress, total_px: f32) -> f32 {
+        total_px * task.percent() as f32 / 100.0
     }
 }
