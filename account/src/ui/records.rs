@@ -21,7 +21,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    Styled as _, Window, div, px,
+    StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use serde_json::json;
 
@@ -570,6 +570,7 @@ impl AccountApp {
             .child(
                 v_flex()
                     .id("cp-picker-list")
+                    .role(gpui_kit::Role::List)
                     .gap_1()
                     .max_h(px(280.))
                     .overflow_y_scrollbar()

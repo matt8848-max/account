@@ -189,6 +189,25 @@ impl AccountApp {
         };
         app.spawn_live_loop(cx);
         app.spawn_update_check(cx);
+        // 关窗前联动关闭后端：在窗口仍有效时执行，最多等待 1.5s。
+        window.on_window_should_close(cx, |_window, _cx| {
+            if let Some((base, version)) = http::session::active() {
+                log::info!("退出前关闭后端服务器: {base}");
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = http::post(&base, "/api/close", Some(json!({})), version);
+                    let _ = tx.send(());
+                });
+                if rx.recv_timeout(Duration::from_millis(1500)).is_err() {
+                    log::warn!("关闭后端超时，直接退出");
+                }
+                http::session::clear();
+            }
+            // 不让 DefWindowProc 再销毁一次窗口；由 GPUI 退出流程统一释放，
+            // 避免 Windows 后端在窗口已销毁后重复 DestroyWindow 的无效句柄日志。
+            _cx.quit();
+            false
+        });
         app
     }
 
@@ -625,26 +644,5 @@ impl Render for AccountApp {
         } else {
             self.main_layout(window, cx).into_any_element()
         }
-    }
-}
-
-impl Drop for AccountApp {
-    /// 窗口/应用退出时联动关闭后端。
-    ///
-    /// 关闭请求在独立线程执行，当前线程最多等待 1.5s：后端已失联时也不会卡住退出。
-    fn drop(&mut self) {
-        let Some((base, version)) = http::session::active() else {
-            return;
-        };
-        log::info!("退出前关闭后端服务器: {base}");
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = http::post(&base, "/api/close", Some(json!({})), version);
-            let _ = tx.send(());
-        });
-        if rx.recv_timeout(Duration::from_millis(1500)).is_err() {
-            log::warn!("关闭后端超时，直接退出");
-        }
-        http::session::clear();
     }
 }

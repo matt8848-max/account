@@ -13,7 +13,8 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{
-    Context, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _, Window, div, px,
+    Context, InteractiveElement as _, IntoElement, ParentElement as _,
+    StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 
 impl AccountApp {
@@ -73,6 +74,7 @@ impl AccountApp {
 
         let content = v_flex()
             .id("content-scroll")
+            .role(gpui_kit::Role::Region)
             .flex_1()
             .h_full()
             .min_h_0()

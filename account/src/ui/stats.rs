@@ -18,8 +18,8 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{
-    Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
-    Window, div, px,
+    Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 
 /// 从按月对象统计构建分组视图，并倒推每月月末结算余额。
@@ -362,6 +362,7 @@ impl AccountApp {
                             .child(
                                 v_flex()
                                     .id("stats-left-list")
+                                    .role(gpui_kit::Role::List)
                                     .gap_1()
                                     .max_h(px(320.))
                                     .overflow_y_scrollbar()
@@ -380,6 +381,7 @@ impl AccountApp {
                             .child(
                                 v_flex()
                                     .id("stats-right-list")
+                                    .role(gpui_kit::Role::List)
                                     .gap_1()
                                     .max_h(px(320.))
                                     .overflow_y_scrollbar()

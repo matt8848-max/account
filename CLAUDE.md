@@ -74,7 +74,9 @@
 - 主界面每 5 分钟自动探测存活；底部状态栏显示存活/失联，点击展开详情
 - 界面提示统一写入 `AccountApp.toast`，底部状态栏显示，3 秒后消失
 - 连接页「连接」兼任进入/返回；地址或协议变化时先断开再重连
-- 桌面端关闭窗口时（`AccountApp::drop`）读取会话中的地址与协议，在独立线程发 `POST /api/close`（1.5s 超时）
+- 桌面端关闭窗口时通过 `window.on_window_should_close` 读取会话中的地址与协议，
+  在独立线程发 `POST /api/close`（1.5s 超时），随后 `cx.quit()` 并返回 `false`，
+  由 GPUI 退出流程统一释放窗口（避免 Windows 重复 DestroyWindow 的无效句柄日志）
 - HTTP 请求统一在 `ui/http.rs` 中通过专用 Tokio 运行时执行，只从 `cx.background_spawn` 调用
 
 ## UI 约定（GPUI）
@@ -88,6 +90,8 @@
   交易对象多时也能快速定位。
 - 列表内所有按钮/元素 ID 必须全局唯一（例如 `del-grp-{gid}-{record_id}`），
   否则 debug 构建会因 `Duplicate a11y node id` panic。
+- 带 `.id(...)` 的可聚焦/滚动容器同时设置 `.role(...)`（如 `Role::Region` / `Role::List`），
+  否则辅助技术会提示“有 id 但没有 role”。
 - 图标资产：
   - Windows 的窗口/任务栏图标由 `build.rs` + `winresource` 把 `assets/icon.ico`
     编入 exe（GPUI 读取资源 ID=1）；
