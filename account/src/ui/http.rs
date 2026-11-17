@@ -80,6 +80,9 @@ fn http3_client() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .timeout(REQUEST_TIMEOUT)
+            // 后端默认监听 IPv4（127.0.0.2）；显式使用 IPv4 本地地址，
+            // 避免 reqwest 的 H3 endpoint 默认绑定 [::]:0 导致 IPv4 目标连接失败。
+            .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
             .http3_prior_knowledge()
             .build()
             .expect("创建 HTTP/3 客户端失败")
@@ -93,6 +96,18 @@ fn client(version: HttpVersion) -> &'static reqwest::Client {
     }
 }
 
+/// 把 reqwest 错误连同底层 source 拼成可读文本（HTTP/3 连接失败时便于排查）。
+fn describe_reqwest_error(err: reqwest::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = std::error::Error::source(&err);
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
+}
+
 /// 发送 PUT/POST 请求并解析 JSON。
 ///
 /// 非 2xx 时优先读取后端统一错误体 `{"error": "..."}`，否则返回状态码文本。
@@ -104,8 +119,9 @@ pub fn request(
     version: HttpVersion,
 ) -> Result<Value, String> {
     let url = format!("{base}{path}");
-    let client = client(version);
     runtime().block_on(async move {
+        // HTTP/3 客户端在构建时就会创建 QUIC endpoint，必须在 Tokio 运行时内构建。
+        let client = client(version);
         let mut req = match method {
             "PUT" => client.put(&url),
             _ => client.post(&url),
@@ -113,7 +129,11 @@ pub fn request(
         if let Some(body) = body {
             req = req.json(&body);
         }
-        let resp = req.send().await.map_err(|e| e.to_string())?;
+        // 仅设置 prior knowledge 还不够：reqwest 依据请求自身的 version 选择 H3 服务。
+        if matches!(version, HttpVersion::Http3) {
+            req = req.version(reqwest::Version::HTTP_3);
+        }
+        let resp = req.send().await.map_err(describe_reqwest_error)?;
         let status = resp.status();
         let text = resp.text().await.map_err(|e| e.to_string())?;
         if status.as_u16() >= 400 {
