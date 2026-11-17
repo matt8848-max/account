@@ -103,6 +103,9 @@ impl AccountApp {
             .collect();
 
         v_flex()
+            .w_full()
+            .items_start()
+            .justify_start()
             .gap_4()
             .child(div().text_xl().child("交易对象与货币管理"))
             .child(

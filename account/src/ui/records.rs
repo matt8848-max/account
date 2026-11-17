@@ -5,29 +5,25 @@
 
 use super::app::{AccountApp, GroupDraftRow};
 use super::confirm::{self, ConfirmAction};
+use super::date;
 use super::http;
-use super::state::{RecordView, build_iso, cp_label, sort_records};
+use super::state::{CpTarget, RecordView, cp_label, filter_candidates, sort_records};
 use crate::server::models::Money;
 use gpui_kit::AppContext as _;
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
+    date_picker::DatePicker,
     h_flex,
     input::{Input, InputState},
+    scroll::ScrollableElement as _,
     v_flex,
 };
 use gpui_kit::{
-    Context, IntoElement, ParentElement as _, SharedString, Styled as _, Window, div, px,
+    Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    Styled as _, Window, div, px,
 };
 use serde_json::json;
-
-/// 交易对象选择目标（筛选 / 草稿转出 / 草稿转入）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CpTarget {
-    Query,
-    DraftFrom(usize),
-    DraftTo(usize),
-}
 
 impl AccountApp {
     /// 交易记录页。
@@ -60,7 +56,7 @@ impl AccountApp {
                 .label(format!("对象：{query_cp_label}"))
                 .on_click(move |_, window, cx| {
                     entity.update(cx, |this, cx| {
-                        this.pick_counterparty(window, cx, CpTarget::Query);
+                        this.open_cp_picker(window, cx, CpTarget::Query);
                     });
                 })
         };
@@ -104,8 +100,15 @@ impl AccountApp {
             .into_iter()
             .map(|r| self.record_row(window, cx, r).into_any_element())
             .collect();
+        let picker = self
+            .cp_picker
+            .as_ref()
+            .map(|(target, search)| (*target, search.clone()));
 
         v_flex()
+            .w_full()
+            .items_start()
+            .justify_start()
             .gap_3()
             .child(div().text_xl().child("交易记录浏览器"))
             .child(
@@ -113,12 +116,18 @@ impl AccountApp {
                     .gap_2()
                     .items_center()
                     .child("从:")
-                    .child(div().w(px(180.)).child(Input::new(&self.query_from)))
+                    .child(div().w(px(200.)).child(DatePicker::new(&self.query_from)))
                     .child("到:")
-                    .child(div().w(px(180.)).child(Input::new(&self.query_to)))
+                    .child(div().w(px(200.)).child(DatePicker::new(&self.query_to)))
                     .child(pick_query_cp)
                     .child(fetch_button),
             )
+            .child(if let Some((target, search)) = picker {
+                self.cp_picker_panel(window, cx, target, search)
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            })
             .child(
                 v_flex()
                     .gap_2()
@@ -189,8 +198,7 @@ impl AccountApp {
     pub fn add_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let amount = cx.new(|cx| InputState::new(window, cx).placeholder("金额（正数）"));
         let remark = cx.new(|cx| InputState::new(window, cx).placeholder("备注（≤256）"));
-        let traded_at =
-            cx.new(|cx| InputState::new(window, cx).default_value(super::state::now_local_iso()));
+        let traded_at = date::new_datetime_picker(window, cx, Some(date::now_local()));
         self.group_drafts.push(GroupDraftRow {
             from_id: 0,
             to_id: 0,
@@ -236,7 +244,7 @@ impl AccountApp {
                 .label(format!("转出：{from_label}"))
                 .on_click(move |_, window, cx| {
                     entity.update(cx, |this, cx| {
-                        this.pick_counterparty(window, cx, CpTarget::DraftFrom(idx));
+                        this.open_cp_picker(window, cx, CpTarget::DraftFrom(idx));
                     });
                 })
         };
@@ -247,7 +255,7 @@ impl AccountApp {
                 .label(format!("转入：{to_label}"))
                 .on_click(move |_, window, cx| {
                     entity.update(cx, |this, cx| {
-                        this.pick_counterparty(window, cx, CpTarget::DraftTo(idx));
+                        this.open_cp_picker(window, cx, CpTarget::DraftTo(idx));
                     });
                 })
         };
@@ -285,7 +293,7 @@ impl AccountApp {
             .child(to_button)
             .child(div().w(px(130.)).child(Input::new(&row.amount)))
             .child(currency_button)
-            .child(div().w(px(170.)).child(Input::new(&row.traded_at)))
+            .child(div().w(px(200.)).child(DatePicker::new(&row.traded_at)))
             .child(div().w(px(200.)).child(Input::new(&row.remark)))
             .child(remove_button)
     }
@@ -322,14 +330,17 @@ impl AccountApp {
                 }
             };
             let remark = d.remark.read(cx).value().trim().to_string();
-            let traded_at = d.traded_at.read(cx).value().trim().to_string();
+            let Some(traded_at) = date::picker_datetime(d.traded_at.read(cx)) else {
+                self.push_toast(cx, format!("第 {} 行：请选择交易时间", i + 1));
+                return;
+            };
             records.push(json!({
                 "from_id": d.from_id,
                 "to_id": d.to_id,
                 "amount": amount,
                 "currency_id": d.currency_id,
                 "remark": if remark.is_empty() { None } else { Some(remark) },
-                "traded_at": build_iso(&traded_at),
+                "traded_at": date::to_api_datetime(traded_at),
             }));
         }
         let body = json!({ "name": name, "records": records });
@@ -373,6 +384,7 @@ impl AccountApp {
         let id = rec.id;
         let gid = rec.group_id;
         let traded_at = rec.traded_at.clone();
+        let traded_at_display = date::display_api_datetime(&traded_at);
         let group_months = rec.group_months.clone();
         let group_label = rec
             .group_name
@@ -408,7 +420,7 @@ impl AccountApp {
         let delete_group = {
             let entity = entity.clone();
             let group_months = group_months.clone();
-            Button::new(SharedString::from(format!("del-grp-{gid}")))
+            Button::new(SharedString::from(format!("del-grp-{gid}-{id}")))
                 .danger()
                 .small()
                 .label("删组")
@@ -433,7 +445,7 @@ impl AccountApp {
             .gap_2()
             .items_center()
             .text_sm()
-            .child(div().w(px(150.)).child(traded_at))
+            .child(div().w(px(150.)).child(traded_at_display))
             .child(div().flex_1().min_w_0().child(from_to))
             .child(
                 div()
@@ -452,61 +464,118 @@ impl AccountApp {
             .child(delete_group)
     }
 
-    /// 弹出交易对象选择框；`target` 决定是筛选还是草稿行。
-    pub fn pick_counterparty(
+    /// 打开交易对象搜索选择面板。
+    pub fn open_cp_picker(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
         target: CpTarget,
     ) {
-        let cps = self.counterparties.clone();
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索交易对象名称/货币"));
+        self._subscriptions.push(cx.subscribe_in(
+            &search,
+            window,
+            |_: &mut Self,
+             _: &Entity<InputState>,
+             _: &gpui_kit::component::input::InputEvent,
+             _: &mut Window,
+             cx| {
+                cx.notify();
+            },
+        ));
+        self.cp_picker = Some((target, search));
+        cx.notify();
+    }
+
+    /// 交易对象搜索选择面板（带搜索、可滚动、左对齐）。
+    pub fn cp_picker_panel(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        target: CpTarget,
+        search: Entity<InputState>,
+    ) -> impl IntoElement {
+        let _ = &window;
+        let currencies = self.currencies.clone();
+        let mut candidates: Vec<(i64, String)> = self
+            .counterparties
+            .iter()
+            .map(|c| (c.id, cp_label(c, &currencies)))
+            .collect();
+        if matches!(target, CpTarget::Query) {
+            candidates.insert(0, (0, "全部".to_string()));
+        }
+        let query = search.read(cx).value().trim().to_string();
+        let filtered = filter_candidates(&candidates, &query);
         let entity = cx.entity();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let mut list = v_flex().gap_1();
-            let all_entity = entity.clone();
-            list = list.child(Button::new("cp-pick-all").label("全部").on_click(
-                move |_, window, cx| {
-                    window.close_dialog(cx);
-                    all_entity.update(cx, |this, cx| {
-                        this.query_cp = 0;
-                        this.refresh_records(cx);
-                        cx.notify();
-                    });
-                },
-            ));
-            for cp in cps.clone() {
-                let id = cp.id;
-                let name = cp.name.clone();
+        let rows: Vec<gpui_kit::AnyElement> = filtered
+            .into_iter()
+            .map(|(id, label)| {
                 let entity = entity.clone();
-                list = list.child(
-                    Button::new(SharedString::from(format!("cp-pick-{id}")))
-                        .label(name)
-                        .on_click(move |_, window, cx| {
-                            window.close_dialog(cx);
-                            entity.update(cx, |this, cx| {
-                                match target {
-                                    CpTarget::Query => {
-                                        this.query_cp = id;
-                                        this.refresh_records(cx);
-                                    }
-                                    CpTarget::DraftFrom(i) => {
-                                        if let Some(row) = this.group_drafts.get_mut(i) {
-                                            row.from_id = id;
-                                        }
-                                    }
-                                    CpTarget::DraftTo(i) => {
-                                        if let Some(row) = this.group_drafts.get_mut(i) {
-                                            row.to_id = id;
-                                        }
+                Button::new(SharedString::from(format!("cp-pick-{id}")))
+                    .w_full()
+                    .label(label)
+                    .on_click(move |_, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            match target {
+                                CpTarget::Query => {
+                                    this.query_cp = id;
+                                    this.refresh_records(cx);
+                                }
+                                CpTarget::DraftFrom(i) => {
+                                    if let Some(row) = this.group_drafts.get_mut(i) {
+                                        row.from_id = id;
                                     }
                                 }
-                                cx.notify();
-                            });
-                        }),
-                );
-            }
-            dialog.title("选择交易对象").child(list)
-        });
+                                CpTarget::DraftTo(i) => {
+                                    if let Some(row) = this.group_drafts.get_mut(i) {
+                                        row.to_id = id;
+                                    }
+                                }
+                            }
+                            this.cp_picker = None;
+                            cx.notify();
+                        });
+                    })
+                    .into_any_element()
+            })
+            .collect();
+        let cancel = {
+            let entity = entity.clone();
+            Button::new("cp-picker-cancel")
+                .small()
+                .label("取消")
+                .on_click(move |_, _, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.cp_picker = None;
+                        cx.notify();
+                    });
+                })
+        };
+
+        v_flex()
+            .w(px(560.))
+            .gap_2()
+            .p_2()
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(px(6.))
+            .bg(cx.theme().background)
+            .child(
+                div()
+                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                    .child("选择交易对象"),
+            )
+            .child(Input::new(&search))
+            .child(
+                v_flex()
+                    .id("cp-picker-list")
+                    .gap_1()
+                    .max_h(px(280.))
+                    .overflow_y_scrollbar()
+                    .children(rows),
+            )
+            .child(h_flex().justify_end().child(cancel))
     }
 
     /// 弹出货币选择框（草稿行）。

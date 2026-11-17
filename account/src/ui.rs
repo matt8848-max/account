@@ -17,8 +17,10 @@
 //! 每个子文件内自带测试；跨文件联动测试放在本文件底部。
 
 pub mod app;
+pub mod assets;
 pub mod confirm;
 pub mod connect;
+pub mod date;
 pub mod export;
 pub mod http;
 pub mod main_layout;

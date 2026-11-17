@@ -8,13 +8,12 @@
 //! `cx.notify()` 触发重绘。
 
 use super::confirm::ConfirmAction;
+use super::date;
 use super::http::{self, HttpVersion};
-use super::state::{
-    ObjectStatView, Page, RecordView, SortOrder, TaskProgress, now_local_iso, now_minus_7d_iso,
-    now_str,
-};
+use super::state::{CpTarget, ObjectStatView, Page, RecordView, SortOrder, TaskProgress, now_str};
 use super::update::{self, UpdateState};
 use crate::server::models::{Counterparty, Currency};
+use gpui_kit::component::date_picker::{DatePickerEvent, DatePickerState};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::{AppContext as _, Context, Entity, IntoElement, Render, Subscription, Window};
 use serde_json::json;
@@ -31,7 +30,7 @@ pub struct GroupDraftRow {
     pub currency_id: i64,
     pub amount: Entity<InputState>,
     pub remark: Entity<InputState>,
-    pub traded_at: Entity<InputState>,
+    pub traded_at: Entity<DatePickerState>,
 }
 
 /// 重命名目标（内联编辑）
@@ -57,8 +56,8 @@ pub struct AccountApp {
     pub(crate) counterparties: Vec<Counterparty>,
     pub(crate) currencies: Vec<Currency>,
 
-    pub(crate) query_from: Entity<InputState>,
-    pub(crate) query_to: Entity<InputState>,
+    pub(crate) query_from: Entity<DatePickerState>,
+    pub(crate) query_to: Entity<DatePickerState>,
     pub(crate) query_cp: i64,
     pub(crate) records: Vec<RecordView>,
     pub(crate) records_order: SortOrder,
@@ -75,17 +74,20 @@ pub struct AccountApp {
     pub(crate) rename_input: Option<Entity<InputState>>,
 
     pub(crate) stats: Vec<ObjectStatView>,
-    pub(crate) stats_from: Entity<InputState>,
-    pub(crate) stats_to: Entity<InputState>,
+    pub(crate) stats_from: Entity<DatePickerState>,
+    pub(crate) stats_to: Entity<DatePickerState>,
     pub(crate) stats_cp: Vec<i64>,
     pub(crate) stats_search: Entity<InputState>,
+
+    /// 交易对象搜索选择面板：`(目标, 搜索框)`。
+    pub(crate) cp_picker: Option<(CpTarget, Entity<InputState>)>,
 
     pub(crate) toast: Option<String>,
     pub(crate) update_state: UpdateState,
     pub(crate) task: Option<TaskProgress>,
     pub(crate) detail_open: bool,
 
-    _subscriptions: Vec<Subscription>,
+    pub(crate) _subscriptions: Vec<Subscription>,
 }
 
 impl AccountApp {
@@ -96,16 +98,8 @@ impl AccountApp {
                 .default_value(DEFAULT_BASE)
                 .placeholder("后端地址")
         });
-        let query_from = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(now_minus_7d_iso())
-                .placeholder("起始时间")
-        });
-        let query_to = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(now_local_iso())
-                .placeholder("结束时间")
-        });
+        let query_from = date::new_datetime_picker(window, cx, Some(date::now_minus_days(7)));
+        let query_to = date::new_datetime_picker(window, cx, Some(date::now_local()));
         let new_group_name =
             cx.new(|cx| InputState::new(window, cx).placeholder("组名称（≤64 字符）"));
         let new_currency_name =
@@ -116,31 +110,38 @@ impl AccountApp {
         let cur_search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索货币"));
         let cp_search =
             cx.new(|cx| InputState::new(window, cx).placeholder("搜索交易对象（名称或货币）"));
-        let stats_from =
-            cx.new(|cx| InputState::new(window, cx).placeholder("起始月份 YYYY-MM（可空）"));
-        let stats_to =
-            cx.new(|cx| InputState::new(window, cx).placeholder("结束月份 YYYY-MM（可空）"));
+        let stats_from = date::new_month_picker(window, cx, None);
+        let stats_to = date::new_month_picker(window, cx, None);
         let stats_search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索交易对象"));
 
         let mut subscriptions = Vec::new();
         for input in [
             &address,
-            &query_from,
-            &query_to,
             &new_group_name,
             &new_currency_name,
             &new_cp_name,
             &new_cp_balance,
             &cur_search,
             &cp_search,
-            &stats_from,
-            &stats_to,
             &stats_search,
         ] {
             subscriptions.push(cx.subscribe_in(
                 input,
                 window,
                 |_: &mut Self, _: &Entity<InputState>, _: &InputEvent, _: &mut Window, cx| {
+                    cx.notify();
+                },
+            ));
+        }
+        for picker in [&query_from, &query_to, &stats_from, &stats_to] {
+            subscriptions.push(cx.subscribe_in(
+                picker,
+                window,
+                |_: &mut Self,
+                 _: &Entity<DatePickerState>,
+                 _: &DatePickerEvent,
+                 _: &mut Window,
+                 cx| {
                     cx.notify();
                 },
             ));
@@ -179,6 +180,7 @@ impl AccountApp {
             stats_to,
             stats_cp: Vec::new(),
             stats_search,
+            cp_picker: None,
             toast: None,
             update_state: UpdateState::Idle,
             task: None,
@@ -233,6 +235,7 @@ impl AccountApp {
         self.api_version = "未知".to_string();
         self.group_drafts.clear();
         self.stats_cp.clear();
+        self.cp_picker = None;
         http::session::clear();
         cx.notify();
     }
@@ -479,6 +482,8 @@ impl AccountApp {
                         this.live_at = now_str();
                         this.status_msg = "已连接".to_string();
                         http::session::set(&session_base, version);
+                        // 进入主界面时默认在记录页：立即按默认筛选拉取一次。
+                        this.refresh_records(cx);
                     }
                     Err(e) => {
                         this.status_msg = e.clone();
@@ -549,12 +554,12 @@ impl AccountApp {
         if base.is_empty() {
             return;
         }
-        let from = self.query_from.read(cx).value().trim().to_string();
-        let to = self.query_to.read(cx).value().trim().to_string();
+        let from = date::picker_datetime(self.query_from.read(cx)).map(date::to_api_datetime);
+        let to = date::picker_datetime(self.query_to.read(cx)).map(date::to_api_datetime);
         let cp = self.query_cp;
         let body = json!({
-            "from": if from.is_empty() { None } else { Some(super::state::build_iso(&from)) },
-            "to": if to.is_empty() { None } else { Some(super::state::build_iso(&to)) },
+            "from": from,
+            "to": to,
             "counterparty_id": if cp == 0 { None } else { Some(cp) },
         });
         cx.spawn(async move |this, cx| {
@@ -586,13 +591,13 @@ impl AccountApp {
             self.push_toast(cx, "请至少选择一个交易对象");
             return;
         }
-        let from = self.stats_from.read(cx).value().trim().to_string();
-        let to = self.stats_to.read(cx).value().trim().to_string();
+        let from = date::picker_month(self.stats_from.read(cx));
+        let to = date::picker_month(self.stats_to.read(cx));
         let ids = self.stats_cp.clone();
         let body = json!({
             "counterparty_ids": ids,
-            "from": if from.is_empty() { None } else { Some(from) },
-            "to": if to.is_empty() { None } else { Some(to) },
+            "from": from,
+            "to": to,
         });
         cx.spawn(async move |this, cx| {
             let result = cx

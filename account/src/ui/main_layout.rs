@@ -8,11 +8,12 @@ use super::state::Page;
 use gpui_kit::component::{
     ActiveTheme as _, Selectable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
-    h_flex, v_flex,
+    h_flex,
+    scroll::ScrollableElement as _,
+    v_flex,
 };
 use gpui_kit::{
-    Context, InteractiveElement as _, IntoElement, ParentElement as _,
-    StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    Context, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _, Window, div, px,
 };
 
 impl AccountApp {
@@ -73,9 +74,11 @@ impl AccountApp {
         let content = v_flex()
             .id("content-scroll")
             .flex_1()
+            .h_full()
+            .min_h_0()
             .min_w_0()
             .p_4()
-            .overflow_y_scroll()
+            .overflow_y_scrollbar()
             .child(match self.page {
                 Page::Records => self.records_page(window, cx).into_any_element(),
                 Page::Master => self.master_page(window, cx).into_any_element(),

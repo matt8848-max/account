@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 
 use super::{
-    adjust_counterparty_balance, counterparty_monthly, counterparty_start_month,
-    ensure_month_table, money_to_text, month_table_name, read_money,
+    adjust_counterparty_balance, counterparty_monthly, ensure_month_table, money_to_text,
+    month_table_name, read_money,
 };
 
 /// 按一条记录联动余额与对象月度明细：转出方减少、转入方增加。
@@ -24,13 +24,10 @@ fn apply_record(conn: &Connection, rec: &RecordSubmit) -> Result<()> {
     adjust_counterparty_balance(conn, rec.to_id, amount)?;
 
     let month = month_of(&rec.traded_at);
-    let from_start = counterparty_start_month(conn, rec.from_id)?;
-    let to_start = counterparty_start_month(conn, rec.to_id)?;
     counterparty_monthly::add_amounts(
         conn,
         rec.from_id,
         rec.currency_id,
-        &from_start,
         month,
         amount,
         Money::ZERO,
@@ -39,7 +36,6 @@ fn apply_record(conn: &Connection, rec: &RecordSubmit) -> Result<()> {
         conn,
         rec.to_id,
         rec.currency_id,
-        &to_start,
         month,
         Money::ZERO,
         amount,
@@ -61,27 +57,9 @@ fn reverse_record(
     adjust_counterparty_balance(conn, from_id, amount)?;
     adjust_counterparty_balance(conn, to_id, negative)?;
 
-    let from_start = counterparty_start_month(conn, from_id)?;
-    let to_start = counterparty_start_month(conn, to_id)?;
     // 月度明细反向：转出、转入都减少。
-    counterparty_monthly::add_amounts(
-        conn,
-        from_id,
-        currency_id,
-        &from_start,
-        month,
-        negative,
-        Money::ZERO,
-    )?;
-    counterparty_monthly::add_amounts(
-        conn,
-        to_id,
-        currency_id,
-        &to_start,
-        month,
-        Money::ZERO,
-        negative,
-    )?;
+    counterparty_monthly::add_amounts(conn, from_id, currency_id, month, negative, Money::ZERO)?;
+    counterparty_monthly::add_amounts(conn, to_id, currency_id, month, Money::ZERO, negative)?;
     Ok(())
 }
 
@@ -857,7 +835,7 @@ mod tests {
         // 内存库：避免产生临时文件垃圾，且无并行锁冲突
         let mut conn = Connection::open_in_memory().expect("打开内存库");
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        // 直接复用生产 schema（含 counterparty_monthly 与 created_month）
+        // 直接复用生产 schema（含 created_month；月度明细为按年分表）
         crate::server::db::init_schema(&conn).expect("初始化内存库 schema");
         // 添加基础数据
         let cid = crate::server::db::add_currency(&conn, "RMB").unwrap();

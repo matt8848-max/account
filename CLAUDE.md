@@ -37,7 +37,8 @@
 └── account/
     ├── Cargo.toml
     ├── .cargo/config.toml  ← RUSTFLAGS: --cfg reqwest_unstable（HTTP/3）
-    ├── assets/             ← 全部图片资产（icon-256.png 等）
+    ├── assets/             ← 全部图片资产（icon.ico / icon-256.png 等）
+    ├── build.rs            ← Windows：把 assets/icon.ico 编入 exe（资源 ID=1）
     ├── certs/              ← 运行期自签名证书（gitignore）
     ├── bin/
     │   ├── account_server.rs
@@ -53,6 +54,8 @@
         │   └── db.rs + db/month.rs + db/counterparty_monthly.rs
         └── ui.rs + ui/
             ├── app.rs / main_layout.rs / state.rs
+            ├── date.rs        ← DatePicker 日期/月份选择封装
+            ├── assets.rs      ← 项目 assets + gpui-kit 资产源、窗口图标
             ├── http.rs / confirm.rs
             ├── connect.rs / records.rs / master.rs / stats.rs
             └── export.rs / status_bar.rs / update.rs
@@ -73,6 +76,23 @@
 - 连接页「连接」兼任进入/返回；地址或协议变化时先断开再重连
 - 桌面端关闭窗口时（`AccountApp::drop`）读取会话中的地址与协议，在独立线程发 `POST /api/close`（1.5s 超时）
 - HTTP 请求统一在 `ui/http.rs` 中通过专用 Tokio 运行时执行，只从 `cx.background_spawn` 调用
+
+## UI 约定（GPUI）
+
+- 三个操作页（记录 / 对象货币 / 统计）内容**左上对齐**，不上下/左右居中。
+- 滚动使用 `gpui_kit::component::scroll::ScrollableElement` 的
+  `overflow_y_scrollbar()`；内容容器需要 `h_full + min_h_0` 才能正确滚动。
+- 日期/时间一律使用 `ui/date.rs` 封装的 gpui-kit `DatePicker`（日期 + 分钟时间；
+  统计月份选 `%Y-%m`），不要退回纯文本输入。
+- 交易对象选择使用 `records.rs` 的搜索面板（输入框 + 过滤列表 + 滚动），
+  交易对象多时也能快速定位。
+- 列表内所有按钮/元素 ID 必须全局唯一（例如 `del-grp-{gid}-{record_id}`），
+  否则 debug 构建会因 `Duplicate a11y node id` panic。
+- 图标资产：
+  - Windows 的窗口/任务栏图标由 `build.rs` + `winresource` 把 `assets/icon.ico`
+    编入 exe（GPUI 读取资源 ID=1）；
+  - Linux/X11 通过 `WindowOptions.icon`（`ui/assets.rs::window_icon`）设置；
+  - `ui/assets.rs` 的 `Assets` 合并项目 `assets/` 与 gpui-kit 默认资产。
 
 ## Money（`server/money.rs`）
 
@@ -99,11 +119,13 @@ pub struct Money { pub value: i128, pub divisor: i128 }
 | `currencies` | 货币（`UNIQUE(name)`） |
 | `counterparties` | 交易对象（余额 TEXT、`created_month`、`UNIQUE(name,currency_id)`） |
 | `transactions_YYYY_MM` | 月表（组与记录同表，金额 TEXT） |
-| `counterparty_monthly` | 对象 × 货币 × 月份：`out_*` / `in_*`（TEXT） |
+| `counterparty_monthly_YYYY` | 按年分表：对象 × 货币 × **有交易的月份**：`out_*` / `in_*`（TEXT） |
 
 - 删除旧的 `total_stats`（每月按货币汇总交易量，无业务意义）；`/api/stats*` 改为按需从月表计算。
-- `counterparty_monthly` 从对象 `created_month` 开始**连续**补齐；每次增删记录在同一事务内更新。
-- 迁移 `2 → 3`：重建月表/交易对象表把金额 `CAST` 为 TEXT，回填月度明细；起始月取“月份最靠前的月表”。
+- 月度明细**按年分表**（`counterparty_monthly_2026` 等），按需惰性创建。
+- **没有交易的月份不建行**；增删后 `out == 0 && in == 0` 时删除该行。
+- 迁移 `2 → 3`：重建月表/交易对象表把金额 `CAST` 为 TEXT，回填真实交易月份到年表。
+- 旧版单表 `counterparty_monthly` 不再兼容：本地调试库直接删除重建（未发布过该结构）。
 - **所有账务修改必须开启事务**：`add_group` / `add_record` / `delete_group` / `delete_record` / `add_counterparty` / `delete_counterparty` / `delete_currency` / `rename_*`。
 - `adjust_counterparty_balance` 必须在事务内调用；失败时月表、余额、月度明细一起回滚。
 

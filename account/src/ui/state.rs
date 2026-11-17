@@ -19,6 +19,14 @@ pub enum Page {
     Stats,
 }
 
+/// 交易对象选择目标（筛选 / 草稿转出 / 草稿转入）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpTarget {
+    Query,
+    DraftFrom(usize),
+    DraftTo(usize),
+}
+
 /// 记录列表排序方向（默认从新到旧）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortOrder {
@@ -175,37 +183,6 @@ pub fn sort_records(records: &mut [RecordView], order: SortOrder) {
     match order {
         SortOrder::NewestFirst => records.sort_by(|a, b| b.traded_at.cmp(&a.traded_at)),
         SortOrder::OldestFirst => records.sort_by(|a, b| a.traded_at.cmp(&b.traded_at)),
-    }
-}
-
-/// 当前本地时间 `YYYY-MM-DDTHH:MM`（交易记录表单默认值）。
-pub fn now_local_iso() -> String {
-    chrono::Local::now().format("%Y-%m-%dT%H:%M").to_string()
-}
-
-/// 当前时间往前 7 天（记录页默认查询起点）。
-pub fn now_minus_7d_iso() -> String {
-    (chrono::Local::now() - chrono::Duration::days(7))
-        .format("%Y-%m-%dT%H:%M")
-        .to_string()
-}
-
-/// `datetime-local` 值补秒为后端 ISO 字符串。
-pub fn build_iso(dt: &str) -> String {
-    let dt = dt.trim();
-    if dt.len() == 16 {
-        format!("{dt}:00")
-    } else {
-        dt.to_string()
-    }
-}
-
-/// 后端 ISO 时间转显示值（去掉秒）。
-pub fn dt_local(v: &str) -> String {
-    if v.len() >= 16 {
-        v[..16].to_string()
-    } else {
-        v.to_string()
     }
 }
 

@@ -4,6 +4,7 @@
 //! 生成与写盘都在后台线程执行，进度写入 `AccountApp.task`（状态栏显示）。
 
 use super::app::AccountApp;
+use super::date;
 use super::http;
 use super::state::{RecordView, TaskProgress};
 use crate::server::export::{
@@ -29,14 +30,8 @@ impl AccountApp {
         let version = self.http_version;
         let cps = self.counterparties.clone();
         let currencies = self.currencies.clone();
-        let from = {
-            let v = self.stats_from.read(cx).value().trim().to_string();
-            if v.is_empty() { None } else { Some(v) }
-        };
-        let to = {
-            let v = self.stats_to.read(cx).value().trim().to_string();
-            if v.is_empty() { None } else { Some(v) }
-        };
+        let from = date::picker_month(self.stats_from.read(cx));
+        let to = date::picker_month(self.stats_to.read(cx));
         let (iso_from, iso_to) = month_bounds(from.as_deref(), to.as_deref());
 
         self.task = Some(TaskProgress::new("导出交易记录", ids.len() + 2));

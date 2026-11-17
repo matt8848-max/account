@@ -5,17 +5,21 @@
 
 use super::app::AccountApp;
 use super::confirm::{self, ConfirmAction};
+use super::date;
 use super::state::{MonthStatView, ObjectGroupView, ObjectStatView, cp_label};
 use crate::server::models::Money;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
+    date_picker::DatePicker,
     h_flex,
     input::Input,
+    scroll::ScrollableElement as _,
     v_flex,
 };
 use gpui_kit::{
-    Context, IntoElement, ParentElement as _, SharedString, Styled as _, Window, div, px,
+    Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
+    Window, div, px,
 };
 
 /// 从按月对象统计构建分组视图，并倒推每月月末结算余额。
@@ -134,8 +138,8 @@ impl AccountApp {
         let currencies = self.currencies.clone();
         let cps = self.counterparties.clone();
         let selected = self.stats_cp.clone();
-        let stats_from = self.stats_from.read(cx).value().trim().to_string();
-        let stats_to = self.stats_to.read(cx).value().trim().to_string();
+        let stats_from = date::picker_month(self.stats_from.read(cx));
+        let stats_to = date::picker_month(self.stats_to.read(cx));
         let query = self.stats_search.read(cx).value().trim().to_lowercase();
 
         let labels: Vec<(i64, String)> = cps
@@ -162,12 +166,7 @@ impl AccountApp {
         for c in &cps {
             balances.insert(c.id, c.balance);
         }
-        let display_to = if stats_to.is_empty() {
-            None
-        } else {
-            Some(stats_to.as_str())
-        };
-        let groups = build_groups(&self.stats, &balances, display_to);
+        let groups = build_groups(&self.stats, &balances, stats_to.as_deref());
 
         let query_button = {
             let entity = entity.clone();
@@ -187,16 +186,8 @@ impl AccountApp {
                 .join("\n");
             let scope = format!(
                 "将导出以下交易对象的交易记录：\n{names}\n\n时间区间：{} ~ {}\n文件格式：.xlsx（每个交易对象一个 sheet）\n\n确认后选择保存位置。",
-                if stats_from.is_empty() {
-                    "不限"
-                } else {
-                    &stats_from
-                },
-                if stats_to.is_empty() {
-                    "不限"
-                } else {
-                    &stats_to
-                },
+                stats_from.as_deref().unwrap_or("不限"),
+                stats_to.as_deref().unwrap_or("不限"),
             );
             Button::new("export-records")
                 .success()
@@ -324,9 +315,13 @@ impl AccountApp {
                 .collect();
 
         v_flex()
+            .w_full()
+            .items_start()
+            .justify_start()
             .gap_3()
             .child(
                 h_flex()
+                    .w_full()
                     .justify_between()
                     .items_center()
                     .child(div().text_xl().child("数据统计"))
@@ -337,9 +332,17 @@ impl AccountApp {
                     .gap_2()
                     .items_center()
                     .child("月份:")
-                    .child(div().w(px(150.)).child(Input::new(&self.stats_from)))
+                    .child(
+                        div()
+                            .w(px(170.))
+                            .child(DatePicker::new(&self.stats_from).placeholder("起始月份")),
+                    )
                     .child("至")
-                    .child(div().w(px(150.)).child(Input::new(&self.stats_to)))
+                    .child(
+                        div()
+                            .w(px(170.))
+                            .child(DatePicker::new(&self.stats_to).placeholder("结束月份")),
+                    )
                     .child(query_button),
             )
             .child(
@@ -356,7 +359,14 @@ impl AccountApp {
                             .p_2()
                             .child(format!("交易对象列表 ({} / {})", filtered.len(), cps.len()))
                             .child(Input::new(&self.stats_search))
-                            .children(left_rows),
+                            .child(
+                                v_flex()
+                                    .id("stats-left-list")
+                                    .gap_1()
+                                    .max_h(px(320.))
+                                    .overflow_y_scrollbar()
+                                    .children(left_rows),
+                            ),
                     )
                     .child(
                         v_flex()
@@ -367,7 +377,14 @@ impl AccountApp {
                             .rounded(px(6.))
                             .p_2()
                             .child(format!("已选择的查询目标 ({})", selected.len()))
-                            .children(right_rows),
+                            .child(
+                                v_flex()
+                                    .id("stats-right-list")
+                                    .gap_1()
+                                    .max_h(px(320.))
+                                    .overflow_y_scrollbar()
+                                    .children(right_rows),
+                            ),
                     ),
             )
             .children(group_cards)

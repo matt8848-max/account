@@ -12,10 +12,13 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(account::ui::assets::Assets)
         .run(|cx| {
             gpui_kit::init(cx);
-            let options = gpui_kit::WindowOptions::default();
+            let options = gpui_kit::WindowOptions {
+                icon: account::ui::assets::window_icon(),
+                ..Default::default()
+            };
             gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| account::ui::AccountApp::new(window, cx))
             })

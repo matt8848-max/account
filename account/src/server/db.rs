@@ -4,12 +4,12 @@
 //! - 月表 `transactions_YYYY_MM` — 该月交易记录（组与记录同表）
 //! - `counterparties` — 交易对象（余额、起始月份）
 //! - `currencies` — 货币
-//! - `counterparty_monthly` — 每个交易对象 × 货币 × 月份的转出/转入明细
+//! - `counterparty_monthly_YYYY` — 每个交易对象 × 货币 × **有交易的月份** 的转出/转入明细
 //!
 //! 版本 3 的关键变化（详见 [`migrate`]）：
 //! - 删除旧的 `total_stats` 汇总表（每月按货币汇总交易量，无业务意义）；
 //! - 金额列从 INTEGER（i64/u32）升级为 **TEXT（i128/i128）**；
-//! - 新增 `counterparty_monthly`，月份从对象首次创建月开始连续；
+//! - 新增按年分表的 `counterparty_monthly_YYYY`，**没有交易的月份不建行**；
 //! - 所有账务修改函数都要求 `&mut Connection` 并在事务内执行。
 
 use super::models::{Counterparty, Currency, Money};
@@ -25,10 +25,11 @@ pub mod month;
 /// 版本历史：
 /// - 1：初始版本（早期库视为版本 0 与之同构）
 /// - 2：月表新增 `group_months` 列
-/// - 3：金额列升级为 TEXT(i128)、删除 `total_stats`、新增 `counterparty_monthly`
+/// - 3：金额列升级为 TEXT(i128)、删除 `total_stats`、新增按年分表的
+///   `counterparty_monthly_YYYY`（无交易不建行）
 pub const DB_VERSION: i64 = 3;
 
-/// 当前本地月份（`YYYY-MM`），用于新建交易对象的 `created_month` 与月度明细补齐。
+/// 当前本地月份（`YYYY-MM`），用于新建交易对象的 `created_month`。
 pub fn current_month() -> String {
     chrono::Local::now().format("%Y-%m").to_string()
 }
@@ -210,8 +211,8 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, ty: &str) -> Resu
 /// 1. 关闭外键（必须在事务外切换）；
 /// 2. 重建所有月表，把金额列 `CAST` 为 TEXT；
 /// 3. 重建 `counterparties`，金额列改 TEXT 并补 `created_month`；
-/// 4. 删除 `total_stats`，创建 `counterparty_monthly`；
-/// 5. 从月表回填对象月度明细，并按“月份最靠前的月表”补齐连续月份。
+/// 4. 删除 `total_stats`；
+/// 5. 从月表回填对象月度明细到 `counterparty_monthly_YYYY` 年表（只写真实交易月份）。
 fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
     conn.execute_batch("PRAGMA foreign_keys = OFF;")
         .context("关闭外键失败")?;
@@ -232,11 +233,8 @@ fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
         rebuild_counterparties(&tx, &start_month)?;
         tx.execute_batch("DROP TABLE IF EXISTS total_stats;")
             .context("删除 total_stats 失败")?;
-        tx.execute_batch(COUNTERPARTY_MONTHLY_DDL)
-            .context("创建 counterparty_monthly 失败")?;
 
         backfill_counterparty_monthly(&tx, &tables)?;
-        ensure_all_counterparty_months(&tx)?;
         tx.commit().context("提交迁移事务失败")?;
         Ok(())
     })();
@@ -283,20 +281,6 @@ fn counterparties_ddl(table: &str) -> String {
     )
 }
 
-/// 对象月度明细表 DDL。
-const COUNTERPARTY_MONTHLY_DDL: &str = "CREATE TABLE IF NOT EXISTS counterparty_monthly (
-    counterparty_id INTEGER NOT NULL REFERENCES counterparties(id) ON DELETE CASCADE,
-    month            TEXT    NOT NULL,
-    currency_id      INTEGER NOT NULL REFERENCES currencies(id),
-    out_value        TEXT    NOT NULL DEFAULT '0',
-    out_divisor      TEXT    NOT NULL DEFAULT '1',
-    in_value         TEXT    NOT NULL DEFAULT '0',
-    in_divisor       TEXT    NOT NULL DEFAULT '1',
-    PRIMARY KEY (counterparty_id, month, currency_id)
-);
-CREATE INDEX IF NOT EXISTS idx_cpm_cp_month
-    ON counterparty_monthly(counterparty_id, month);";
-
 /// 重建单个月表：旧金额列 INTEGER → 新 TEXT。
 fn rebuild_month_table(tx: &Transaction<'_>, table: &str) -> Result<()> {
     let new_table = format!("{table}__v3");
@@ -338,23 +322,16 @@ fn rebuild_counterparties(tx: &Transaction<'_>, start_month: &str) -> Result<()>
     Ok(())
 }
 
-/// 从月表回填 `counterparty_monthly`。
+/// 从月表回填 `counterparty_monthly_YYYY` 年表。
 fn backfill_counterparty_monthly(tx: &Transaction<'_>, tables: &[String]) -> Result<()> {
-    // 对象 → (货币, 起始月)
-    let mut start_months: std::collections::HashMap<i64, (i64, String)> =
-        std::collections::HashMap::new();
+    // 对象 → 货币
+    let mut currencies: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
     {
-        let mut stmt = tx.prepare("SELECT id, currency_id, created_month FROM counterparties")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })?;
+        let mut stmt = tx.prepare("SELECT id, currency_id FROM counterparties")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
         for row in rows {
-            let (id, currency_id, start) = row?;
-            start_months.insert(id, (currency_id, start));
+            let (id, currency_id) = row?;
+            currencies.insert(id, currency_id);
         }
     }
 
@@ -374,52 +351,27 @@ fn backfill_counterparty_monthly(tx: &Transaction<'_>, tables: &[String]) -> Res
         for row in rows {
             let (from_id, to_id, value, divisor) = row?;
             let amount = money_from_text(&value, &divisor)?;
-            if let Some((currency_id, start)) = start_months.get(&from_id) {
+            if let Some(currency_id) = currencies.get(&from_id) {
                 counterparty_monthly::add_amounts(
                     tx,
                     from_id,
                     *currency_id,
-                    start,
                     &month,
                     amount,
                     Money::ZERO,
                 )?;
             }
-            if let Some((currency_id, start)) = start_months.get(&to_id) {
+            if let Some(currency_id) = currencies.get(&to_id) {
                 counterparty_monthly::add_amounts(
                     tx,
                     to_id,
                     *currency_id,
-                    start,
                     &month,
                     Money::ZERO,
                     amount,
                 )?;
             }
         }
-    }
-    Ok(())
-}
-
-/// 为所有对象补齐从 `created_month` 到“最晚月份”的连续月度行。
-fn ensure_all_counterparty_months(tx: &Transaction<'_>) -> Result<()> {
-    let max_month = existing_transaction_tables(tx)?
-        .last()
-        .map(|t| month_from_table_name(t))
-        .unwrap_or_else(current_month);
-    let through = max_month.max(current_month());
-
-    let mut stmt = tx.prepare("SELECT id, currency_id, created_month FROM counterparties")?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, String>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (id, currency_id, start) = row?;
-        counterparty_monthly::ensure_month_rows(tx, id, currency_id, &start, &through)?;
     }
     Ok(())
 }
@@ -463,8 +415,6 @@ fn init_schema(conn: &Connection) -> Result<()> {
     .context("创建 currencies 表失败")?;
     conn.execute_batch(&counterparties_ddl("counterparties"))
         .context("创建 counterparties 表失败")?;
-    conn.execute_batch(COUNTERPARTY_MONTHLY_DDL)
-        .context("创建 counterparty_monthly 表失败")?;
     Ok(())
 }
 
@@ -537,11 +487,7 @@ pub fn delete_currency(conn: &mut Connection, id: i64) -> Result<bool> {
         |r| r.get(0),
     )?;
     let used_in_records: bool = month::currency_used(&tx, id)?;
-    let used_in_monthly: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM counterparty_monthly WHERE currency_id = ?1)",
-        [id],
-        |r| r.get(0),
-    )?;
+    let used_in_monthly: bool = counterparty_monthly::currency_used(&tx, id)?;
     if used_in_counterparty || used_in_records || used_in_monthly {
         return Ok(false);
     }
@@ -552,7 +498,7 @@ pub fn delete_currency(conn: &mut Connection, id: i64) -> Result<bool> {
 
 // ---------- 交易对象 ----------
 
-/// 添加交易对象，并在同一事务内初始化其月度明细（从当前月到当前月）。
+/// 添加交易对象（不创建任何月度明细；有交易时才会建行）。
 pub fn add_counterparty(
     conn: &mut Connection,
     name: &str,
@@ -570,7 +516,6 @@ pub fn add_counterparty(
     )
     .context("插入交易对象失败")?;
     let id = tx.last_insert_rowid();
-    counterparty_monthly::ensure_month_rows(&tx, id, currency_id, &created_month, &created_month)?;
     tx.commit().context("提交事务失败")?;
     Ok(id)
 }
@@ -642,16 +587,6 @@ pub fn adjust_counterparty_balance(conn: &Connection, id: i64, delta: Money) -> 
     Ok(())
 }
 
-/// 读取交易对象的起始月份（月度明细从该月开始连续）。
-pub fn counterparty_start_month(conn: &Connection, id: i64) -> Result<String> {
-    conn.query_row(
-        "SELECT created_month FROM counterparties WHERE id = ?1",
-        [id],
-        |r| r.get(0),
-    )
-    .with_context(|| format!("交易对象不存在: id={id}"))
-}
-
 /// 删除交易对象（必须未被任何记录使用；月度明细随外键级联删除）。
 pub fn delete_counterparty(conn: &mut Connection, id: i64) -> Result<bool> {
     let tx = conn.transaction().context("开启事务失败")?;
@@ -704,10 +639,10 @@ mod tests {
         assert!(delete_currency(&mut conn, cid).unwrap());
     }
 
-    /// 验证新增交易对象：余额按 TEXT 保存、created_month 为当前月、
-    /// 月度明细从当前月开始连续。
+    /// 验证新增交易对象：余额按 TEXT 保存、created_month 为当前月，
+    /// 且不创建任何月度明细行（无交易不建行）。
     #[test]
-    fn add_counterparty_should_initialize_monthly_rows() {
+    fn add_counterparty_should_not_create_monthly_rows() {
         let mut conn = test_conn();
         let cid = add_currency(&conn, "RMB").unwrap();
         let balance = Money::new(123, 100).unwrap();
@@ -729,10 +664,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].month, current_month());
-        assert!(rows[0].out_amount.is_zero());
-        assert!(rows[0].in_amount.is_zero());
+        assert!(rows.is_empty());
+        // 不相等断言：新建对象不能凭空产生月度行
+        assert_ne!(rows.len(), 1);
     }
 
     /// 验证余额调整：正负增量都按数值累加，i128 精度不丢失。
@@ -749,9 +683,10 @@ mod tests {
         assert_ne!(balance, Money::new(1125, 10).unwrap());
     }
 
-    /// 验证新建数据库直接是版本 3，且不再创建 total_stats。
+    /// 验证新建数据库直接是版本 3：无 total_stats、无单表 counterparty_monthly，
+    /// 年表按需创建。
     #[test]
-    fn open_creates_v3_without_total_stats() {
+    fn open_creates_v3_without_total_stats_or_monthly_tables() {
         let conn = open(Path::new(":memory:")).unwrap();
         assert_eq!(db_version(&conn).unwrap(), DB_VERSION);
         let has_total_stats: bool = conn
@@ -762,20 +697,25 @@ mod tests {
             )
             .unwrap();
         assert!(!has_total_stats);
-        let has_monthly: bool = conn
+        let has_legacy_monthly: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='counterparty_monthly')",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(has_monthly);
+        assert!(!has_legacy_monthly);
+        assert!(
+            counterparty_monthly::existing_years(&conn)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// 验证 v2 → v3 迁移：
     /// - 金额列改为 TEXT 且数值不变；
     /// - total_stats 被删除；
-    /// - 月度明细按最早月表回填，并补齐连续月份。
+    /// - 月度明细按年表回填，只写真实交易月份（不补空月份）。
     #[test]
     fn migrate_v2_to_v3_should_upgrade_money_and_backfill_monthly() {
         let conn = Connection::open_in_memory().unwrap();
@@ -870,10 +810,24 @@ mod tests {
             .unwrap();
         assert_eq!(balance, ("-13000".into(), "100".into()));
 
+        // 年表：2026 年表存在，且没有单表 counterparty_monthly
+        assert_eq!(
+            counterparty_monthly::existing_years(&conn).unwrap(),
+            vec![2026]
+        );
+        let has_legacy: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='counterparty_monthly')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!has_legacy);
+
         // 月度明细：8 月转出 100、9 月转出 30；转入方对应 100/30
         let aug_out: (String, String) = conn
             .query_row(
-                "SELECT out_value, out_divisor FROM counterparty_monthly
+                "SELECT out_value, out_divisor FROM counterparty_monthly_2026
                  WHERE counterparty_id = 1 AND month = '2026-08'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -885,7 +839,7 @@ mod tests {
         );
         let sep_in: (String, String) = conn
             .query_row(
-                "SELECT in_value, in_divisor FROM counterparty_monthly
+                "SELECT in_value, in_divisor FROM counterparty_monthly_2026
                  WHERE counterparty_id = 2 AND month = '2026-09'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -896,7 +850,7 @@ mod tests {
             Money::from(30)
         );
 
-        // 连续月份：从 2026-08 一直到当前月，中间无缺口
+        // 只有真实交易月份：8 月与 9 月各一行，不补 10 月/11 月等空月份
         let rows = counterparty_monthly::list(
             &conn,
             &crate::server::models::CounterpartyMonthlyQuery {
@@ -906,16 +860,10 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].month, "2026-08");
-        assert_eq!(rows.last().unwrap().month, current_month());
-        let mut expected = "2026-08".to_string();
-        for row in &rows {
-            assert_eq!(row.month, expected, "月度明细必须连续");
-            if expected != current_month() {
-                expected = counterparty_monthly::next_month(&expected).unwrap();
-            }
-        }
-        // 不相等断言：月度明细不能为空
-        assert_ne!(rows.len(), 0);
+        assert_eq!(rows[1].month, "2026-09");
+        // 不相等断言：不能补出空月份
+        assert_ne!(rows.len(), 3);
     }
 }

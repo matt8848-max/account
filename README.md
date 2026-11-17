@@ -26,7 +26,10 @@
 - 以「交易组」为单位记账：一个组可包含多条转入/转出记录，便于记录一次拆分消费
 - 支持跨月组：同一组的记录可以分布在不同月份
 - 按时间范围、交易对象筛选；进入页面自动刷新
+- 日期/时间使用 gpui-kit 日历选择器，无需手输
+- 交易对象选择支持搜索（对象多时按名称/货币过滤）
 - 记录排序切换（从新到旧 / 从旧到新）
+- 三个操作页均支持滚动条、内容左上对齐
 - 删除单条记录 / 整个组前弹出确认框，余额与对象月度明细自动回滚
 
 ### 交易对象与货币
@@ -126,7 +129,8 @@ cargo run --bin account_client --features client
 
 ## 数据与安全
 
-- **数据存储**：SQLite 单文件、按月分表 + `counterparty_monthly`（对象月度明细），默认 `account.db`
+- **数据存储**：SQLite 单文件、交易记录按月分表；对象月度明细按年分表
+  `counterparty_monthly_YYYY`，**没有交易的月份不建行**，默认 `account.db`
 - **金额精度**：`i128 / i128` 定点数，禁止浮点；数据库以 TEXT 保存分子/分母
 - **传输安全**：HTTPS；HTTP/2（TCP）或 HTTP/3（QUIC）由启动参数选择；首次启动自动生成自签名证书
 - 桌面客户端与后端之间跳过自签证书校验（本地自用场景）
@@ -154,6 +158,7 @@ cargo fmt
 account/
 ├── bin/account_server.rs   # 计算端（TLS HTTP/2 或 QUIC HTTP/3 + API + CLI）
 ├── bin/account_client.rs   # GPUI 桌面客户端启动器
+├── build.rs                # Windows：把 assets/icon.ico 编入 exe 资源（ID=1）
 ├── assets/                 # 全部图片资产（窗口/安装包图标）
 └── src/
     ├── lib.rs              # 只注册 server / ui
@@ -163,10 +168,12 @@ account/
     │   ├── models.rs       # 数据模型（含对象月度明细）
     │   ├── export.rs       # xlsx 纯逻辑
     │   ├── api.rs          # 路由、AppState、Shutdown
-    │   └── db.rs + db/     # schema/迁移、月表、counterparty_monthly
+    │   └── db.rs + db/     # schema/迁移、月表、counterparty_monthly_YYYY
     └── ui.rs + ui/         # GPUI 客户端（父模块只注册/导出）
         ├── app.rs          # 根视图 AccountApp
         ├── state.rs        # 纯状态与函数（含测试）
+        ├── date.rs         # DatePicker 日期/月份选择封装
+        ├── assets.rs       # 项目 assets + gpui-kit 资产源、窗口图标
         ├── http.rs         # HTTP/2 与 HTTP/3、连接会话
         ├── connect.rs / records.rs / master.rs / stats.rs
         ├── export.rs / status_bar.rs / update.rs / confirm.rs
