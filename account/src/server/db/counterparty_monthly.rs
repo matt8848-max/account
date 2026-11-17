@@ -92,7 +92,15 @@ pub fn add_amounts(
     } else {
         start_month
     };
-    ensure_month_rows(conn, counterparty_id, currency_id, start, month)?;
+    // 补齐到“交易月份与当前月”的较晚者：保证任意一次账务写入后，
+    // 该对象的月度明细都从起始月连续到当前月（无交易的月份为 0）。
+    let today = super::current_month();
+    let through = if month > today.as_str() {
+        month
+    } else {
+        today.as_str()
+    };
+    ensure_month_rows(conn, counterparty_id, currency_id, start, through)?;
 
     let (out, incoming) = {
         let mut stmt = conn.prepare(
