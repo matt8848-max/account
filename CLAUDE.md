@@ -53,11 +53,12 @@
         │   ├── api.rs
         │   └── db.rs + db/month.rs + db/counterparty_monthly.rs
         └── ui.rs + ui/
-            ├── app.rs / main_layout.rs / state.rs
+            ├── app.rs / main_layout.rs / app_state.rs
             ├── date.rs        ← DatePicker 日期/月份选择封装
             ├── assets.rs      ← 项目 assets + gpui-kit 资产源、窗口图标
             ├── http.rs / confirm.rs
-            ├── connect.rs / records.rs / master.rs / stats.rs
+            ├── connect.rs / records.rs / master.rs / stats_page.rs
+            ├── sankey.rs      ← 桑基图/流向图（纯 div，无第三方绘图库）
             └── export.rs / status_bar.rs / update.rs
 ```
 
@@ -81,17 +82,26 @@
 
 ## UI 约定（GPUI）
 
-- 三个操作页（记录 / 对象货币 / 统计）内容**左上对齐**，不上下/左右居中。
-- 滚动使用 `gpui_kit::component::scroll::ScrollableElement` 的
-  `overflow_y_scrollbar()`；内容容器需要 `h_full + min_h_0` 才能正确滚动。
+- 三个操作页（记录 / 对象货币 / 统计）内容**左上对齐**，不上下/左右居中；
+  连接页内容上下左右居中；初始窗口为主显示器可用区域的 80%×80%。
+- 滚动使用 `gpui_kit::component::scroll::ScrollableElement`：内容区由
+  `overflow_scroll() + track_scroll(handle)` 组成固定尺寸的滚动区域，
+  再在**外层未滚动容器**上挂 `vertical_scrollbar` / `horizontal_scrollbar`。
+  不要用 `Scrollable::Both`（`overflow_scrollbar()`）：它会把内容压成可视区高度，导致竖向滚动失效。
+  内容容器需要 `h_full + min_h_0` 才能正确滚动。
+- 三个操作页根节点带 `min_w(PAGE_MIN_WIDTH)`：窗口更窄时出现横向滚动条，
+  避免筛选行/卡片表格被压扁。
 - 日期/时间一律使用 `ui/date.rs` 封装的 gpui-kit `DatePicker`（日期 + 分钟时间；
   统计月份选 `%Y-%m`），不要退回纯文本输入。
-- 交易对象选择使用 `records.rs` 的搜索面板（输入框 + 过滤列表 + 滚动），
-  交易对象多时也能快速定位。
+- 交易对象选择使用 `records.rs` 的弹出窗口（输入框 + 过滤列表 + 滚动），
+  交易对象多时也能快速定位；草稿行两侧都选中后自动校验货币一致性。
 - 列表内所有按钮/元素 ID 必须全局唯一（例如 `del-grp-{gid}-{record_id}`），
   否则 debug 构建会因 `Duplicate a11y node id` panic。
 - 带 `.id(...)` 的可聚焦/滚动容器同时设置 `.role(...)`（如 `Role::Region` / `Role::List`），
   否则辅助技术会提示“有 id 但没有 role”。
+- gpui-kit 0.10 的 `Input` 外框固定 `Presentational` + `track_focus`，会在输入框获得焦点时
+  打印一条 info 级 a11y 误报；客户端启动时用
+  `filter_module("gpui::window::a11y", LevelFilter::Warn)` 过滤该条 info（warn/error 仍保留）。
 - 图标资产：
   - Windows 的窗口/任务栏图标由 `build.rs` + `winresource` 把 `assets/icon.ico`
     编入 exe（GPUI 读取资源 ID=1）；
@@ -108,13 +118,29 @@ pub struct Money { pub value: i128, pub divisor: i128 }
 - `new(value, divisor)`：校验分母为正，**不约分**；`Money::from_string` 默认按十进制（`"1.23"` → `123/100`）。
 - 删除 `from_int` / `to_decimal_string`；用 `Money::from(i128)`、`Money::ZERO`、`Display`、`FromStr`。
 - `Display` 支持任意分母长除法，最多 12 位小数并去尾零（`5/2` → `2.5`，`1/3` → `0.333333333333`）。
-- 判等/排序按**数值**而非内部表示：手写 `PartialEq/Eq/Ord/PartialOrd`（交叉相乘；极端溢出退回 f64）。
+- 判等/排序按**数值**而非内部表示：手写 `PartialEq/Eq/Ord/PartialOrd`（交叉相乘；
+  溢出时先完整约分，再用欧几里得分数比较，绝不退回 `f64`）。
+- `percent_string()`：按百分数解释并输出两位小数（`12.34%`），供卡片/导出复用。
 - `Deserialize` 复用 `new` 校验分母，拒绝 0/负数。
 - 四则运算统一 `checked_add / checked_sub / checked_mul / checked_div`，结果自动 `normalized()`。
 - 约分规则（成本受控）：
   1. 分子、分母同为偶数 → 位运算判断，各除以 2（**一次 `if`**）；
-  2. 分母 > `REDUCE_DIVISOR_THRESHOLD`（1e9）→ 做一次完整 gcd。
+  2. 分母 > `REDUCE_DIVISOR_THRESHOLD`（**2^30 − 1**）→ 做一次完整 gcd。
 - 数据库以 TEXT 保存分子/分母（SQLite INTEGER 只有 64 位，不能存 i128）。
+
+## 统计页（`ui/stats_page.rs` + `ui/sankey.rs`）
+
+- 卡片横向排列（`overflow_x_scrollbar`），每张卡内是表格：
+  月份 / 收入 / 收入环比 / 收入同比 / 支出 / 支出环比 / 支出同比 / 结算余额，
+  行背景斑马纹交替；环比/同比由 `Money` 计算并格式化为 `12.34%`。
+- 展示月份按用户选择的范围连续生成：没有交易的月份收入/支出记 0。
+- 环比/同比使用 `RatioValue` 三态：基准月份早于账号开始记账 → 留空；
+  基准月份在范围内但数值为 0 → 显示 `N.A.`；其余为 `12.34%`。
+- 查询时 `refresh_stats` 会**多取 12 个月**数据用于同比，展示仍按用户选的起始月过滤。
+- 桑基图用纯 `div` 绘制（金额 → 条带高度，`sankey::amount_heights` 为纯函数）；
+  布局为「左流入 / 中主要对象组 / 右流出」三栏，双向往来按净额合并后只出现在一侧。
+- 导出确认弹窗可选附加 sheet：交易对象卡片、桑基图/流向图；
+  两者都保留原始金额分子/分母并开启自动筛选。
 
 ## 数据库（`DB_VERSION = 3`）
 
@@ -251,6 +277,6 @@ cargo build --release --bin account_client --features client
 
 ## 版本
 
-- 当前 `0.5.0`；`Cargo.toml`、`Cargo.lock`、README、本文件、更新日志需同步。
+- 当前 `0.5.1`；`Cargo.toml`、`Cargo.lock`、README、本文件、更新日志需同步。
 
 

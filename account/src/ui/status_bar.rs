@@ -6,7 +6,7 @@
 //! - 提示信息 + 长任务进度条
 
 use super::app::AccountApp;
-use super::state::TaskProgress;
+use super::app_state::TaskProgress;
 use super::update::{self, UpdateState};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _,

@@ -4,7 +4,7 @@
 //! 页面切换只改 `page` 字段，布局本身不重建。
 
 use super::app::AccountApp;
-use super::state::Page;
+use super::app_state::Page;
 use gpui_kit::component::{
     ActiveTheme as _, Selectable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
@@ -72,20 +72,37 @@ impl AccountApp {
                 )
         };
 
-        let content = v_flex()
-            .id("content-scroll")
-            .role(gpui_kit::Role::Region)
+        let page = match self.page {
+            Page::Records => self.records_page(window, cx).into_any_element(),
+            Page::Master => self.master_page(window, cx).into_any_element(),
+            Page::Stats => self.stats_page(window, cx).into_any_element(),
+        };
+
+        // 自建双向滚动容器：
+        // - 内层 `v_flex` 是真正的滚动区域（`overflow_scroll` + `track_scroll`），
+        //   尺寸固定为可视区，页面内容靠 `min_w` 横向溢出、靠自然高度纵向溢出；
+        // - 滚动条放在外层未滚动容器上，避免随内容一起滚动，
+        //   也不会像 gpui-kit `Scrollable::Both` 那样把内容压成可视区高度而丢失竖向滚动。
+        let content = div()
+            .relative()
             .flex_1()
             .h_full()
             .min_h_0()
             .min_w_0()
-            .p_4()
-            .overflow_y_scrollbar()
-            .child(match self.page {
-                Page::Records => self.records_page(window, cx).into_any_element(),
-                Page::Master => self.master_page(window, cx).into_any_element(),
-                Page::Stats => self.stats_page(window, cx).into_any_element(),
-            });
+            .child(
+                v_flex()
+                    .id("content-scroll")
+                    .role(gpui_kit::Role::Region)
+                    .size_full()
+                    .min_h_0()
+                    .min_w_0()
+                    .p_4()
+                    .overflow_scroll()
+                    .track_scroll(&self.content_scroll)
+                    .child(page),
+            )
+            .vertical_scrollbar(&self.content_scroll)
+            .horizontal_scrollbar(&self.content_scroll);
 
         v_flex()
             .size_full()
