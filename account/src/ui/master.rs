@@ -4,9 +4,9 @@
 //! 两个表单 + 两个列表。
 
 use super::app::{AccountApp, RenameTarget};
+use super::app_state::{PAGE_MIN_WIDTH, apply_counterparty_rename, apply_currency_rename};
 use super::confirm::{self, ConfirmAction};
 use super::http;
-use super::state::{apply_counterparty_rename, apply_currency_rename};
 use crate::server::models::{Counterparty, Currency, Money};
 use gpui_kit::AppContext as _;
 use gpui_kit::component::{
@@ -104,6 +104,7 @@ impl AccountApp {
 
         v_flex()
             .w_full()
+            .min_w(px(PAGE_MIN_WIDTH))
             .items_start()
             .justify_start()
             .gap_4()

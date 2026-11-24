@@ -21,6 +21,41 @@ use rust_xlsxwriter::{
     ExcelDateTime, Format, FormatAlign, FormatBorder, Formula, Workbook, XlsxError,
 };
 
+/// 环比/同比的展示值。
+///
+/// 三态区分的目的是让「基准月份不在数据库范围内」与「基准值为 0」在界面上有不同表现：
+/// - [`RatioValue::OutOfRange`]：基准月份尚未开始记账 → 留空；
+/// - [`RatioValue::NotApplicable`]：基准月份在范围内但数值为 0，无法计算增长率 → `N.A.`；
+/// - [`RatioValue::Value`]：正常百分比（`12.34%`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RatioValue {
+    /// 基准月份不在数据库记录范围内：留空
+    OutOfRange,
+    /// 基准值为 0：无法计算，显示 `N.A.`
+    NotApplicable,
+    /// 百分比数值（`12.34` 表示 12.34%）
+    Value(Money),
+}
+
+impl RatioValue {
+    /// 界面/导出文本：空串、`N.A.` 或 `12.34%`。
+    pub fn display(self) -> String {
+        match self {
+            Self::OutOfRange => String::new(),
+            Self::NotApplicable => "N.A.".to_string(),
+            Self::Value(percent) => percent.percent_string(),
+        }
+    }
+
+    /// 百分比数值；`OutOfRange` / `NotApplicable` 返回 `None`。
+    pub fn amount(self) -> Option<Money> {
+        match self {
+            Self::Value(percent) => Some(percent),
+            _ => None,
+        }
+    }
+}
+
 /// 表头（顺序即列顺序，属于导出格式的一部分，勿随意调整）
 const HEADERS: [&str; 9] = [
     "转出/转入",
@@ -118,6 +153,56 @@ pub struct ExportSheet {
     /// 结束月份 `YYYY-MM`；None 表示不限
     pub month_to: Option<String>,
     pub records: Vec<ExportRecord>,
+}
+
+/// 卡片导出的一行：交易对象 × 月份，包含环比/同比与原始分子/分母。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportCardRow {
+    pub counterparty: String,
+    pub currency: String,
+    pub month: String,
+    pub income: Option<Money>,
+    pub income_mom: RatioValue,
+    pub income_yoy: RatioValue,
+    pub expense: Option<Money>,
+    pub expense_mom: RatioValue,
+    pub expense_yoy: RatioValue,
+    pub settlement: Money,
+}
+
+/// 桑基图/流向图导出的一行：主要对象 ↔ 次要对象（双向合并）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportFlowRow {
+    pub main: String,
+    pub other: String,
+    pub currency: String,
+    pub out_amount: Money,
+    pub in_amount: Money,
+}
+
+impl ExportFlowRow {
+    /// 往来合计（转出 + 转入）。
+    pub fn total(&self) -> Money {
+        self.out_amount
+            .checked_add(self.in_amount)
+            .unwrap_or(self.out_amount)
+    }
+
+    /// 净额（转入 − 转出）。
+    pub fn net(&self) -> Money {
+        self.in_amount
+            .checked_sub(self.out_amount)
+            .unwrap_or(self.in_amount)
+    }
+}
+
+/// 附加 sheet（与交易流水 sheet 一起写入同一个 workbook）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExtraSheet {
+    /// 所有交易对象的卡片，合并为一张可筛选的表。
+    Cards(Vec<ExportCardRow>),
+    /// 桑基图/流向图数据。
+    Sankey(Vec<ExportFlowRow>),
 }
 
 /// 汇总结果：转入合计、转出合计、净额（净额 = 转入 − 转出）
@@ -420,7 +505,17 @@ fn xlsx_err(err: XlsxError) -> String {
 ///
 /// 无任何数据时返回错误（不生成空文件）。
 pub fn build_xlsx(sheets: &[ExportSheet]) -> Result<Vec<u8>, String> {
-    if sheets.is_empty() {
+    build_xlsx_with_extras(sheets, &[])
+}
+
+/// 生成 xlsx 字节流，并附带 [`ExtraSheet`]（卡片统计 / 桑基图）。
+///
+/// `sheets` 与 `extras` 同时为空时返回错误；只导出附加内容也是允许的。
+pub fn build_xlsx_with_extras(
+    sheets: &[ExportSheet],
+    extras: &[ExtraSheet],
+) -> Result<Vec<u8>, String> {
+    if sheets.is_empty() && extras.is_empty() {
         return Err("没有可导出的数据".to_string());
     }
 
@@ -533,9 +628,306 @@ pub fn build_xlsx(sheets: &[ExportSheet]) -> Result<Vec<u8>, String> {
         }
     }
 
+    // 附加 sheet：卡片统计 / 桑基图（同一 workbook，名称去重）
+    write_extra_sheets(&mut workbook, extras, &mut used_names)?;
+
     workbook
         .save_to_buffer()
         .map_err(|e| format!("生成 xlsx 失败: {e}"))
+}
+
+/// 写入全部附加 sheet。
+fn write_extra_sheets(
+    workbook: &mut Workbook,
+    extras: &[ExtraSheet],
+    used_names: &mut Vec<String>,
+) -> Result<(), String> {
+    for extra in extras {
+        match extra {
+            ExtraSheet::Cards(rows) => write_cards_sheet(workbook, rows, used_names)?,
+            ExtraSheet::Sankey(rows) => write_sankey_sheet(workbook, rows, used_names)?,
+        }
+    }
+    Ok(())
+}
+
+/// 按「表头 + 数据实际显示文本」计算每列宽度（像素）。
+fn auto_widths(headers: &[&str], rows: &[Vec<String>]) -> Vec<u32> {
+    let mut max_cols: Vec<usize> = headers.iter().map(|h| display_cols(h)).collect();
+    for row in rows {
+        for (idx, text) in row.iter().enumerate() {
+            if idx < max_cols.len() {
+                max_cols[idx] = max_cols[idx].max(display_cols(text));
+            }
+        }
+    }
+    max_cols.into_iter().map(column_width_px).collect()
+}
+
+/// 写一张「附加」sheet 的表头（自动筛选 + 冻结由调用方设置）。
+fn write_extra_header<'a>(
+    workbook: &'a mut Workbook,
+    name: &str,
+    headers: &[&str],
+    widths: &[u32],
+) -> Result<&'a mut rust_xlsxwriter::Worksheet, String> {
+    let header_fmt = Format::new()
+        .set_bold()
+        .set_align(FormatAlign::Center)
+        .set_border(FormatBorder::Thin)
+        .set_background_color("#D9E1F2");
+    let worksheet = workbook.add_worksheet();
+    worksheet.set_name(name).map_err(xlsx_err)?;
+    for (col, title) in headers.iter().enumerate() {
+        worksheet
+            .write_string_with_format(0, col as u16, *title, &header_fmt)
+            .map_err(xlsx_err)?;
+    }
+    for (col, width) in widths.iter().enumerate() {
+        worksheet
+            .set_column_width_pixels(col as u16, *width)
+            .map_err(xlsx_err)?;
+    }
+    Ok(worksheet)
+}
+
+/// 写入可选金额单元格：`None` 留空（不写任何内容）。
+fn write_optional_amount(
+    worksheet: &mut rust_xlsxwriter::Worksheet,
+    row: u32,
+    col: u16,
+    value: Option<Money>,
+    fmt: &Format,
+) -> Result<(), String> {
+    if let Some(m) = value {
+        worksheet
+            .write_number_with_format(row, col, m.value as f64 / m.divisor as f64, fmt)
+            .map_err(xlsx_err)?;
+    }
+    Ok(())
+}
+
+/// 卡片统计 sheet：所有卡片合并为一张表，保留原始分子/分母，开启自动筛选。
+fn write_cards_sheet(
+    workbook: &mut Workbook,
+    rows: &[ExportCardRow],
+    used_names: &mut Vec<String>,
+) -> Result<(), String> {
+    const HEADERS: [&str; 16] = [
+        "交易对象",
+        "货币",
+        "月份",
+        "收入",
+        "收入环比",
+        "收入同比",
+        "支出",
+        "支出环比",
+        "支出同比",
+        "结算余额",
+        "收入分子",
+        "收入分母",
+        "支出分子",
+        "支出分母",
+        "结算分子",
+        "结算分母",
+    ];
+    let name = sheet_name("交易对象卡片", "", used_names);
+    let body_fmt = Format::new().set_align(FormatAlign::Center);
+    let amount_fmt = Format::new()
+        .set_num_format("#,##0.######")
+        .set_align(FormatAlign::Center);
+    let int_fmt = Format::new()
+        .set_num_format("0")
+        .set_align(FormatAlign::Center);
+
+    // 先构造显示文本用于列宽计算
+    let display: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            let money = |m: Option<Money>| m.map(|x| amount_display(&x)).unwrap_or_default();
+            let pct = |v: RatioValue| v.display();
+            let raw = |m: Option<Money>, num: bool| match m {
+                Some(x) if num => x.value.to_string(),
+                Some(x) => x.divisor.to_string(),
+                None => String::new(),
+            };
+            vec![
+                r.counterparty.clone(),
+                r.currency.clone(),
+                r.month.clone(),
+                money(r.income),
+                pct(r.income_mom),
+                pct(r.income_yoy),
+                money(r.expense),
+                pct(r.expense_mom),
+                pct(r.expense_yoy),
+                amount_display(&r.settlement),
+                raw(r.income, true),
+                raw(r.income, false),
+                raw(r.expense, true),
+                raw(r.expense, false),
+                r.settlement.value.to_string(),
+                r.settlement.divisor.to_string(),
+            ]
+        })
+        .collect();
+    let widths = auto_widths(&HEADERS, &display);
+    let worksheet = write_extra_header(workbook, &name, &HEADERS, &widths)?;
+    if rows.is_empty() {
+        worksheet
+            .write_string_with_format(1, 0, "没有卡片数据（请先查询统计）", &body_fmt)
+            .map_err(xlsx_err)?;
+    }
+
+    for (idx, r) in rows.iter().enumerate() {
+        let row = 1 + idx as u32;
+        worksheet
+            .write_string_with_format(row, 0, r.counterparty.as_str(), &body_fmt)
+            .map_err(xlsx_err)?;
+        worksheet
+            .write_string_with_format(row, 1, r.currency.as_str(), &body_fmt)
+            .map_err(xlsx_err)?;
+        worksheet
+            .write_string_with_format(row, 2, r.month.as_str(), &body_fmt)
+            .map_err(xlsx_err)?;
+        write_optional_amount(worksheet, row, 3, r.income, &amount_fmt)?;
+        let income_mom = r.income_mom.display();
+        worksheet
+            .write_string_with_format(row, 4, income_mom.as_str(), &body_fmt)
+            .map_err(xlsx_err)?;
+        let income_yoy = r.income_yoy.display();
+        worksheet
+            .write_string_with_format(row, 5, income_yoy.as_str(), &body_fmt)
+            .map_err(xlsx_err)?;
+        write_optional_amount(worksheet, row, 6, r.expense, &amount_fmt)?;
+        let expense_mom = r.expense_mom.display();
+        worksheet
+            .write_string_with_format(row, 7, expense_mom.as_str(), &body_fmt)
+            .map_err(xlsx_err)?;
+        let expense_yoy = r.expense_yoy.display();
+        worksheet
+            .write_string_with_format(row, 8, expense_yoy.as_str(), &body_fmt)
+            .map_err(xlsx_err)?;
+        write_optional_amount(worksheet, row, 9, Some(r.settlement), &amount_fmt)?;
+        // 原始分子/分母（与默认导出保持一致）
+        for (col, value) in [
+            (10u16, r.income.map(|m| m.value)),
+            (11, r.income.map(|m| m.divisor)),
+            (12, r.expense.map(|m| m.value)),
+            (13, r.expense.map(|m| m.divisor)),
+            (14, Some(r.settlement.value)),
+            (15, Some(r.settlement.divisor)),
+        ] {
+            if let Some(v) = value {
+                worksheet
+                    .write_number_with_format(row, col, v as f64, &int_fmt)
+                    .map_err(xlsx_err)?;
+            }
+        }
+    }
+
+    let last_row = rows.len() as u32;
+    worksheet.autofilter(0, 0, last_row, 15).map_err(xlsx_err)?;
+    worksheet.set_freeze_panes(1, 0).map_err(xlsx_err)?;
+    Ok(())
+}
+
+/// 桑基图/流向图 sheet：一行一对「主要对象 ↔ 次要对象」。
+fn write_sankey_sheet(
+    workbook: &mut Workbook,
+    rows: &[ExportFlowRow],
+    used_names: &mut Vec<String>,
+) -> Result<(), String> {
+    const HEADERS: [&str; 11] = [
+        "主要对象",
+        "次要对象",
+        "货币",
+        "转出",
+        "转入",
+        "往来合计",
+        "净额",
+        "转出分子",
+        "转出分母",
+        "转入分子",
+        "转入分母",
+    ];
+    let name = sheet_name("资金流向", "", used_names);
+    let body_fmt = Format::new().set_align(FormatAlign::Center);
+    let amount_fmt = Format::new()
+        .set_num_format("#,##0.######")
+        .set_align(FormatAlign::Center);
+    let int_fmt = Format::new()
+        .set_num_format("0")
+        .set_align(FormatAlign::Center);
+
+    let display: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            vec![
+                r.main.clone(),
+                r.other.clone(),
+                r.currency.clone(),
+                amount_display(&r.out_amount),
+                amount_display(&r.in_amount),
+                amount_display(&r.total()),
+                amount_display(&r.net()),
+                r.out_amount.value.to_string(),
+                r.out_amount.divisor.to_string(),
+                r.in_amount.value.to_string(),
+                r.in_amount.divisor.to_string(),
+            ]
+        })
+        .collect();
+    let widths = auto_widths(&HEADERS, &display);
+    let worksheet = write_extra_header(workbook, &name, &HEADERS, &widths)?;
+    if rows.is_empty() {
+        worksheet
+            .write_string_with_format(
+                1,
+                0,
+                "所选范围内没有流向数据（可能全部为组内互转）",
+                &body_fmt,
+            )
+            .map_err(xlsx_err)?;
+    }
+
+    for (idx, r) in rows.iter().enumerate() {
+        let row = 1 + idx as u32;
+        worksheet
+            .write_string_with_format(row, 0, r.main.as_str(), &body_fmt)
+            .map_err(xlsx_err)?;
+        worksheet
+            .write_string_with_format(row, 1, r.other.as_str(), &body_fmt)
+            .map_err(xlsx_err)?;
+        worksheet
+            .write_string_with_format(row, 2, r.currency.as_str(), &body_fmt)
+            .map_err(xlsx_err)?;
+        for (col, m) in [
+            (3u16, r.out_amount),
+            (4, r.in_amount),
+            (5, r.total()),
+            (6, r.net()),
+        ] {
+            worksheet
+                .write_number_with_format(row, col, m.value as f64 / m.divisor as f64, &amount_fmt)
+                .map_err(xlsx_err)?;
+        }
+        for (col, v) in [
+            (7u16, r.out_amount.value),
+            (8, r.out_amount.divisor),
+            (9, r.in_amount.value),
+            (10, r.in_amount.divisor),
+        ] {
+            worksheet
+                .write_number_with_format(row, col, v as f64, &int_fmt)
+                .map_err(xlsx_err)?;
+        }
+    }
+
+    let last_row = rows.len() as u32;
+    worksheet.autofilter(0, 0, last_row, 10).map_err(xlsx_err)?;
+    worksheet.set_freeze_panes(1, 0).map_err(xlsx_err)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -764,6 +1156,69 @@ mod tests {
         let bytes = build_xlsx(&[sheet(vec![rec(Direction::In, 1, 1, "not-a-time")])])
             .expect("时间解析失败不应导致导出失败");
         assert_eq!(&bytes[..2], b"PK");
+    }
+
+    /// 验证空附加 sheet：勾选但无数据时仍生成合法 workbook（sheet 内写明原因），不报错。
+    #[test]
+    fn build_xlsx_with_extras_should_allow_empty_extra_sheets() {
+        let bytes = build_xlsx_with_extras(
+            &[],
+            &[ExtraSheet::Cards(vec![]), ExtraSheet::Sankey(vec![])],
+        )
+        .expect("空附加 sheet 也应生成文件");
+        assert_eq!(&bytes[..2], b"PK");
+        assert!(bytes.len() > 1000);
+    }
+
+    /// 验证环比/同比三态文本：范围外留空、基准 0 显示 N.A.、正常值显示百分比。
+    #[test]
+    fn ratio_value_should_render_blank_na_or_percent() {
+        assert_eq!(RatioValue::OutOfRange.display(), "");
+        assert_eq!(RatioValue::NotApplicable.display(), "N.A.");
+        assert_eq!(
+            RatioValue::Value(Money::new(1234, 100).unwrap()).display(),
+            "12.34%"
+        );
+        assert_eq!(RatioValue::Value(Money::ZERO).amount(), Some(Money::ZERO));
+        assert_eq!(RatioValue::NotApplicable.amount(), None);
+        // 不相等断言：N.A. 不能与留空混淆
+        assert_ne!(RatioValue::NotApplicable.display(), "");
+    }
+
+    /// 验证附加 sheet：卡片与流向可只导出附加内容，workbook 仍为合法 zip。
+    #[test]
+    fn build_xlsx_with_extras_should_write_card_and_sankey_sheets() {
+        let cards = vec![ExportCardRow {
+            counterparty: "支付宝".into(),
+            currency: "RMB".into(),
+            month: "2026-08".into(),
+            income: Some(Money::from(100)),
+            income_mom: RatioValue::Value(Money::new(1, 2).unwrap()),
+            income_yoy: RatioValue::OutOfRange,
+            expense: Some(Money::new(205, 100).unwrap()),
+            expense_mom: RatioValue::Value(Money::new(-1, 4).unwrap()),
+            expense_yoy: RatioValue::NotApplicable,
+            settlement: Money::from(70),
+        }];
+        let flows = vec![ExportFlowRow {
+            main: "支付宝".into(),
+            other: "微信".into(),
+            currency: "RMB".into(),
+            out_amount: Money::from(30),
+            in_amount: Money::from(12),
+        }];
+        let bytes = build_xlsx_with_extras(
+            &[],
+            &[ExtraSheet::Cards(cards), ExtraSheet::Sankey(flows.clone())],
+        )
+        .expect("只导出附加内容应成功");
+        assert_eq!(&bytes[..2], b"PK");
+        assert!(bytes.len() > 1000);
+        // 不相等断言：空附加内容与空流水仍应报错
+        assert!(build_xlsx_with_extras(&[], &[]).is_err());
+        assert_eq!(flows[0].total(), Money::from(42));
+        assert_eq!(flows[0].net(), Money::from(-18));
+        assert_ne!(flows[0].total(), flows[0].net());
     }
 
     /// 验证空导出（无对象）返回错误，避免生成空文件

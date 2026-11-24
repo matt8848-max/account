@@ -1,17 +1,21 @@
 //! 客户端根视图
 //!
 //! `AccountApp` 持有全部页面状态与输入框实体；具体页面渲染拆分到：
-//! - `connect.rs` / `records.rs` / `master.rs` / `stats.rs`
+//! - `connect.rs` / `records.rs` / `master.rs` / `stats_page.rs`
 //! - `main_layout.rs` 负责侧栏 + 内容 + 状态栏布局
 //!
 //! 网络请求统一通过 `http` 模块在后台线程执行，结果回到 UI 线程后
 //! `cx.notify()` 触发重绘。
 
+use super::app_state::{
+    FlowView, ObjectStatView, Page, RecordView, SortOrder, TaskProgress, build_flows, now_str,
+    shift_month,
+};
 use super::confirm::ConfirmAction;
 use super::date;
 use super::http::{self, HttpVersion};
-use super::state::{CpTarget, ObjectStatView, Page, RecordView, SortOrder, TaskProgress, now_str};
 use super::update::{self, UpdateState};
+use crate::server::export::month_bounds;
 use crate::server::models::{Counterparty, Currency};
 use gpui_kit::component::date_picker::{DatePickerEvent, DatePickerState};
 use gpui_kit::component::input::{InputEvent, InputState};
@@ -78,14 +82,23 @@ pub struct AccountApp {
     pub(crate) stats_to: Entity<DatePickerState>,
     pub(crate) stats_cp: Vec<i64>,
     pub(crate) stats_search: Entity<InputState>,
+    /// 桑基图/流向图数据（「画图」后填充）
+    pub(crate) flows: Vec<FlowView>,
+    /// 是否展示桑基图（查询/断开后重置）
+    pub(crate) show_sankey: bool,
 
-    /// 交易对象搜索选择面板：`(目标, 搜索框)`。
-    pub(crate) cp_picker: Option<(CpTarget, Entity<InputState>)>,
+    /// 导出选项：是否附带「交易对象卡片」sheet
+    pub(crate) export_cards: bool,
+    /// 导出选项：是否附带「桑基图/流向图」sheet
+    pub(crate) export_sankey: bool,
 
     pub(crate) toast: Option<String>,
     pub(crate) update_state: UpdateState,
     pub(crate) task: Option<TaskProgress>,
     pub(crate) detail_open: bool,
+
+    /// 内容区（三个操作页共用）的滚动句柄：同时驱动横/竖滚动条。
+    pub(crate) content_scroll: gpui_kit::ScrollHandle,
 
     pub(crate) _subscriptions: Vec<Subscription>,
 }
@@ -180,11 +193,15 @@ impl AccountApp {
             stats_to,
             stats_cp: Vec::new(),
             stats_search,
-            cp_picker: None,
+            flows: Vec::new(),
+            show_sankey: false,
+            export_cards: false,
+            export_sankey: false,
             toast: None,
             update_state: UpdateState::Idle,
             task: None,
             detail_open: false,
+            content_scroll: gpui_kit::ScrollHandle::new(),
             _subscriptions: subscriptions,
         };
         app.spawn_live_loop(cx);
@@ -254,7 +271,8 @@ impl AccountApp {
         self.api_version = "未知".to_string();
         self.group_drafts.clear();
         self.stats_cp.clear();
-        self.cp_picker = None;
+        self.flows.clear();
+        self.show_sankey = false;
         http::session::clear();
         cx.notify();
     }
@@ -612,10 +630,13 @@ impl AccountApp {
         }
         let from = date::picker_month(self.stats_from.read(cx));
         let to = date::picker_month(self.stats_to.read(cx));
+        // 多取一年数据：卡片里的环比/同比需要上月/去年同月作为基准，
+        // 展示时仍按用户选择的起始月份过滤（见 build_groups 的 display_from）。
+        let query_from = from.as_deref().and_then(|m| shift_month(m, -12));
         let ids = self.stats_cp.clone();
         let body = json!({
             "counterparty_ids": ids,
-            "from": from,
+            "from": query_from,
             "to": to,
         });
         cx.spawn(async move |this, cx| {
@@ -626,8 +647,55 @@ impl AccountApp {
                 .await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(v) => this.stats = serde_json::from_value(v).unwrap_or_default(),
+                    Ok(v) => {
+                        this.stats = serde_json::from_value(v).unwrap_or_default();
+                        // 统计范围变化后旧流向图失效
+                        this.flows.clear();
+                        this.show_sankey = false;
+                    }
                     Err(e) => this.push_toast(cx, format!("统计失败: {e}")),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 按当前月份范围拉取全部记录并构建桑基图/流向图。
+    pub fn refresh_flows(&mut self, cx: &mut Context<Self>) {
+        let base = self.base(cx);
+        let version = self.http_version;
+        if base.is_empty() {
+            return;
+        }
+        if self.stats_cp.is_empty() {
+            self.push_toast(cx, "请至少选择一个交易对象");
+            return;
+        }
+        let ids = self.stats_cp.clone();
+        let from = date::picker_month(self.stats_from.read(cx));
+        let to = date::picker_month(self.stats_to.read(cx));
+        let (iso_from, iso_to) = month_bounds(from.as_deref(), to.as_deref());
+        let body = json!({ "from": iso_from, "to": iso_to });
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(
+                    async move { http::put(&base, "/api/records", Some(body), version) },
+                )
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(v) => {
+                        let records: Vec<RecordView> =
+                            serde_json::from_value(v).unwrap_or_default();
+                        this.flows = build_flows(&records, &ids);
+                        this.show_sankey = true;
+                        if this.flows.is_empty() {
+                            this.push_toast(cx, "所选范围内没有可绘制的流向");
+                        }
+                    }
+                    Err(e) => this.push_toast(cx, format!("画图失败: {e}")),
                 }
                 cx.notify();
             })

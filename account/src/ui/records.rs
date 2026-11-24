@@ -4,14 +4,17 @@
 //! 记录列表支持删除单条/整组与排序切换。布局与旧版保持一致。
 
 use super::app::{AccountApp, GroupDraftRow};
+use super::app_state::{
+    CpTarget, DraftCurrencyCheck, PAGE_MIN_WIDTH, RecordView, check_draft_currency, cp_label,
+    filter_candidates, sort_records,
+};
 use super::confirm::{self, ConfirmAction};
 use super::date;
 use super::http;
-use super::state::{CpTarget, RecordView, cp_label, filter_candidates, sort_records};
 use crate::server::models::Money;
 use gpui_kit::AppContext as _;
 use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     date_picker::DatePicker,
     h_flex,
@@ -20,7 +23,7 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{
-    Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Role, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use serde_json::json;
@@ -56,7 +59,7 @@ impl AccountApp {
                 .label(format!("对象：{query_cp_label}"))
                 .on_click(move |_, window, cx| {
                     entity.update(cx, |this, cx| {
-                        this.open_cp_picker(window, cx, CpTarget::Query);
+                        this.pick_counterparty(window, cx, CpTarget::Query);
                     });
                 })
         };
@@ -100,13 +103,10 @@ impl AccountApp {
             .into_iter()
             .map(|r| self.record_row(window, cx, r).into_any_element())
             .collect();
-        let picker = self
-            .cp_picker
-            .as_ref()
-            .map(|(target, search)| (*target, search.clone()));
 
         v_flex()
             .w_full()
+            .min_w(px(PAGE_MIN_WIDTH))
             .items_start()
             .justify_start()
             .gap_3()
@@ -122,12 +122,6 @@ impl AccountApp {
                     .child(pick_query_cp)
                     .child(fetch_button),
             )
-            .child(if let Some((target, search)) = picker {
-                self.cp_picker_panel(window, cx, target, search)
-                    .into_any_element()
-            } else {
-                div().into_any_element()
-            })
             .child(
                 v_flex()
                     .gap_2()
@@ -244,7 +238,7 @@ impl AccountApp {
                 .label(format!("转出：{from_label}"))
                 .on_click(move |_, window, cx| {
                     entity.update(cx, |this, cx| {
-                        this.open_cp_picker(window, cx, CpTarget::DraftFrom(idx));
+                        this.pick_counterparty(window, cx, CpTarget::DraftFrom(idx));
                     });
                 })
         };
@@ -255,7 +249,7 @@ impl AccountApp {
                 .label(format!("转入：{to_label}"))
                 .on_click(move |_, window, cx| {
                     entity.update(cx, |this, cx| {
-                        this.open_cp_picker(window, cx, CpTarget::DraftTo(idx));
+                        this.pick_counterparty(window, cx, CpTarget::DraftTo(idx));
                     });
                 })
         };
@@ -285,6 +279,19 @@ impl AccountApp {
                     });
                 })
         };
+        // 复制上一行的转出/转入/货币/日期：首行没有上一行，按钮禁用。
+        let copy_previous = {
+            let entity = entity.clone();
+            Button::new(SharedString::from(format!("draft-copy-{idx}")))
+                .small()
+                .disabled(idx == 0)
+                .label("⧉ 复制上一行")
+                .on_click(move |_, window, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.copy_previous_draft(window, cx, idx);
+                    });
+                })
+        };
 
         h_flex()
             .gap_2()
@@ -295,6 +302,7 @@ impl AccountApp {
             .child(currency_button)
             .child(div().w(px(200.)).child(DatePicker::new(&row.traded_at)))
             .child(div().w(px(200.)).child(Input::new(&row.remark)))
+            .child(copy_previous)
             .child(remove_button)
     }
 
@@ -344,21 +352,21 @@ impl AccountApp {
             }));
         }
         let body = json!({ "name": name, "records": records });
-        // 先清空草稿与组名，避免成功后重复提交。
-        self.group_drafts.clear();
-        self.new_group_name
-            .update(cx, |state, cx| state.set_value("", window, cx));
-
-        cx.spawn(async move |this, cx| {
+        // 注意：这里**不能**先清空草稿/组名。后端仍可能因业务校验失败而拒绝创建，
+        // 若提前清空，用户已录入的内容会丢失。成功回调里再清理。
+        cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_spawn(
                     async move { http::post(&base, "/api/groups", Some(body), version) },
                 )
                 .await;
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(v) => {
                         let id = v["id"].as_i64().unwrap_or(0);
+                        this.group_drafts.clear();
+                        this.new_group_name
+                            .update(cx, |state, cx| state.set_value("", window, cx));
                         this.push_toast(cx, format!("组已创建 id={id}"));
                         this.refresh_counterparties(cx);
                         this.refresh_records(cx);
@@ -417,6 +425,7 @@ impl AccountApp {
                     );
                 })
         };
+        let group_label_text = group_label.clone();
         let delete_group = {
             let entity = entity.clone();
             let group_months = group_months.clone();
@@ -461,11 +470,22 @@ impl AccountApp {
                 div().into_any_element()
             })
             .child(delete_record)
+            // 组名位于「删除本条」与「删除整组」之间，便于确认该记录属于哪个组。
+            .child(
+                div()
+                    .max_w(px(180.))
+                    .truncate()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(group_label_text),
+            )
             .child(delete_group)
     }
 
-    /// 打开交易对象搜索选择面板。
-    pub fn open_cp_picker(
+    /// 弹出交易对象选择窗口（筛选 / 草稿转出 / 草稿转入共用）。
+    ///
+    /// 与「选择货币」保持一致：使用 `open_dialog` 弹出窗口；窗口内保留搜索框，
+    /// 交易对象较多时也能快速定位。
+    pub fn pick_counterparty(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -483,100 +503,152 @@ impl AccountApp {
                 cx.notify();
             },
         ));
-        self.cp_picker = Some((target, search));
+        let entity = cx.entity();
+        let currencies = self.currencies.clone();
+        let cps = self.counterparties.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let search = search.clone();
+            let currencies = currencies.clone();
+            let cps = cps.clone();
+            let entity = entity.clone();
+            dialog.title("选择交易对象").content(move |content, _, cx| {
+                let query = search.read(cx).value().trim().to_string();
+                let mut candidates: Vec<(i64, String)> = cps
+                    .iter()
+                    .map(|c| (c.id, cp_label(c, &currencies)))
+                    .collect();
+                if matches!(target, CpTarget::Query) {
+                    candidates.insert(0, (0, "全部".to_string()));
+                }
+                let rows: Vec<gpui_kit::AnyElement> = filter_candidates(&candidates, &query)
+                    .into_iter()
+                    .map(|(id, label)| {
+                        let entity = entity.clone();
+                        Button::new(SharedString::from(format!("cp-pick-{id}")))
+                            .w_full()
+                            .label(label)
+                            .on_click(move |_, window, cx| {
+                                window.close_dialog(cx);
+                                entity.update(cx, |this, cx| {
+                                    this.apply_cp_choice(target, id, cx);
+                                });
+                            })
+                            .into_any_element()
+                    })
+                    .collect();
+                content
+                    .child(Input::new(&search))
+                    .child(
+                        v_flex()
+                            .id("cp-picker-list")
+                            .role(Role::List)
+                            .gap_1()
+                            .max_h(px(280.))
+                            .overflow_y_scrollbar()
+                            .children(rows),
+                    )
+                    .child(
+                        h_flex().justify_end().child(
+                            Button::new("cp-picker-cancel")
+                                .small()
+                                .label("取消")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        ),
+                    )
+            })
+        });
+    }
+
+    /// 应用交易对象选择结果。
+    ///
+    /// 草稿行两侧都选中后自动校验货币：一致时自动填入货币类型；
+    /// 不一致时提示并清空转入方（与用户先选转出还是先选转入无关）。
+    pub fn apply_cp_choice(&mut self, target: CpTarget, id: i64, cx: &mut Context<Self>) {
+        if matches!(target, CpTarget::Query) {
+            self.query_cp = id;
+            self.refresh_records(cx);
+            return;
+        }
+        let Some(idx) = target.draft_index() else {
+            return;
+        };
+        let Some(row) = self.group_drafts.get(idx) else {
+            return;
+        };
+        let from_id = if matches!(target, CpTarget::DraftFrom(_)) {
+            id
+        } else {
+            row.from_id
+        };
+        let to_id = if matches!(target, CpTarget::DraftTo(_)) {
+            id
+        } else {
+            row.to_id
+        };
+        let from_cur = self
+            .counterparties
+            .iter()
+            .find(|c| c.id == from_id)
+            .map(|c| c.currency_id);
+        let to_cur = self
+            .counterparties
+            .iter()
+            .find(|c| c.id == to_id)
+            .map(|c| c.currency_id);
+        let check = check_draft_currency(from_cur, to_cur);
+        let mut mismatch = false;
+        if let Some(row) = self.group_drafts.get_mut(idx) {
+            match target {
+                CpTarget::DraftFrom(_) => row.from_id = id,
+                CpTarget::DraftTo(_) => row.to_id = id,
+                CpTarget::Query => {}
+            }
+            match check {
+                DraftCurrencyCheck::Matched(currency_id) => row.currency_id = currency_id,
+                DraftCurrencyCheck::Mismatch => {
+                    row.to_id = 0;
+                    mismatch = true;
+                }
+                DraftCurrencyCheck::Pending => {}
+            }
+        }
+        if mismatch {
+            self.push_toast(
+                cx,
+                format!(
+                    "第 {} 行：转入/转出对象的货币类型不一致，已清空转入方",
+                    idx + 1
+                ),
+            );
+        }
         cx.notify();
     }
 
-    /// 交易对象搜索选择面板（带搜索、可滚动、左对齐）。
-    pub fn cp_picker_panel(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        target: CpTarget,
-        search: Entity<InputState>,
-    ) -> impl IntoElement {
-        let _ = &window;
-        let currencies = self.currencies.clone();
-        let mut candidates: Vec<(i64, String)> = self
-            .counterparties
-            .iter()
-            .map(|c| (c.id, cp_label(c, &currencies)))
-            .collect();
-        if matches!(target, CpTarget::Query) {
-            candidates.insert(0, (0, "全部".to_string()));
+    /// 复制上一行的转出/转入/货币类型/日期（不含金额与备注）。
+    pub fn copy_previous_draft(&mut self, window: &mut Window, cx: &mut Context<Self>, idx: usize) {
+        if idx == 0 || idx >= self.group_drafts.len() {
+            return;
         }
-        let query = search.read(cx).value().trim().to_string();
-        let filtered = filter_candidates(&candidates, &query);
-        let entity = cx.entity();
-        let rows: Vec<gpui_kit::AnyElement> = filtered
-            .into_iter()
-            .map(|(id, label)| {
-                let entity = entity.clone();
-                Button::new(SharedString::from(format!("cp-pick-{id}")))
-                    .w_full()
-                    .label(label)
-                    .on_click(move |_, _, cx| {
-                        entity.update(cx, |this, cx| {
-                            match target {
-                                CpTarget::Query => {
-                                    this.query_cp = id;
-                                    this.refresh_records(cx);
-                                }
-                                CpTarget::DraftFrom(i) => {
-                                    if let Some(row) = this.group_drafts.get_mut(i) {
-                                        row.from_id = id;
-                                    }
-                                }
-                                CpTarget::DraftTo(i) => {
-                                    if let Some(row) = this.group_drafts.get_mut(i) {
-                                        row.to_id = id;
-                                    }
-                                }
-                            }
-                            this.cp_picker = None;
-                            cx.notify();
-                        });
-                    })
-                    .into_any_element()
-            })
-            .collect();
-        let cancel = {
-            let entity = entity.clone();
-            Button::new("cp-picker-cancel")
-                .small()
-                .label("取消")
-                .on_click(move |_, _, cx| {
-                    entity.update(cx, |this, cx| {
-                        this.cp_picker = None;
-                        cx.notify();
-                    });
-                })
+        let (from_id, to_id, currency_id, traded_at) = {
+            let prev = &self.group_drafts[idx - 1];
+            (
+                prev.from_id,
+                prev.to_id,
+                prev.currency_id,
+                date::picker_datetime(prev.traded_at.read(cx)),
+            )
         };
-
-        v_flex()
-            .w(px(560.))
-            .gap_2()
-            .p_2()
-            .border_1()
-            .border_color(cx.theme().border)
-            .rounded(px(6.))
-            .bg(cx.theme().background)
-            .child(
-                div()
-                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                    .child("选择交易对象"),
-            )
-            .child(Input::new(&search))
-            .child(
-                v_flex()
-                    .id("cp-picker-list")
-                    .role(gpui_kit::Role::List)
-                    .gap_1()
-                    .max_h(px(280.))
-                    .overflow_y_scrollbar()
-                    .children(rows),
-            )
-            .child(h_flex().justify_end().child(cancel))
+        let Some(row) = self.group_drafts.get_mut(idx) else {
+            return;
+        };
+        row.from_id = from_id;
+        row.to_id = to_id;
+        row.currency_id = currency_id;
+        if let Some(dt) = traded_at {
+            row.traded_at
+                .update(cx, |state, cx| state.set_date_time(dt, window, cx));
+        }
+        cx.notify();
     }
 
     /// 弹出货币选择框（草稿行）。

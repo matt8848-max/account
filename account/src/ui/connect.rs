@@ -107,8 +107,8 @@ impl AccountApp {
 
         v_flex()
             .size_full()
-            .items_start()
-            .justify_start()
+            .items_center()
+            .justify_center()
             .p_10()
             .gap_3()
             .bg(cx.theme().background)
